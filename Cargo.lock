@@ -359,6 +359,7 @@ name = "websocket-nvim"
 version = "0.1.0"
 dependencies = [
  "nvim-oxi",
+ "serde",
 ]
 
 [[package]]
