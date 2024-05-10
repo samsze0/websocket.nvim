@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::error::Error;
 use std::num::TryFromIntError;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -8,10 +9,11 @@ use std::thread;
 use std::time::Duration;
 
 use lazy_static::lazy_static;
+use mlua::prelude::*;
 use nvim_oxi::conversion::{Error as ConversionError, FromObject, ToObject};
 use nvim_oxi::libuv::{AsyncHandle, TimerHandle};
 use nvim_oxi::serde::{Deserializer, Serializer};
-use nvim_oxi::{api, lua, print, schedule, Dictionary, Error, Function, Object};
+use nvim_oxi::{api, lua, mlua::lua, print, schedule, Dictionary, Function, Object};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -45,128 +47,142 @@ fn websocket_nvim() -> nvim_oxi::Result<Dictionary> {
     Ok(api)
 }
 
-fn new_client(_: ()) -> nvim_oxi::Result<String> {
+fn new_client(client_id: String) -> nvim_oxi::Result<()> {
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = WebsocketClient::new()?;
-    let client_id = client.id.clone();
+    let client = WebsocketClient::new(client_id).unwrap();
     registry.insert(client);
-    Ok(client_id.to_string())
+    Ok(())
 }
 
-fn connect(client_id: String) -> nvim_oxi::Result<bool> {
+fn connect(client_id: String) -> nvim_oxi::Result<()> {
     let client_id = Uuid::parse_str(&client_id).unwrap();
 
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    if let Some(client) = registry.get_mut(&client_id) {
-        client.connect();
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    let client = registry.get_mut(&client_id).unwrap();
+    client.connect();
+    Ok(())
 }
 
-fn disconnect(client_id: String) -> nvim_oxi::Result<bool> {
+fn disconnect(client_id: String) -> nvim_oxi::Result<()> {
     let client_id = Uuid::parse_str(&client_id).unwrap();
 
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    if let Some(client) = registry.get_mut(&client_id) {
-        client.disconnect();
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    let client = registry.get_mut(&client_id).unwrap();
+    client.disconnect();
+    Ok(())
 }
 
-fn send_data((client_id, data): (String, String)) -> nvim_oxi::Result<bool> {
+fn send_data((client_id, data): (String, String)) -> nvim_oxi::Result<()> {
     let client_id = Uuid::parse_str(&client_id).unwrap();
 
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    if let Some(client) = registry.get_mut(&client_id) {
-        client.send_data(data);
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    let client = registry.get_mut(&client_id).unwrap();
+    client.send_data(data);
+    Ok(())
 }
 
-fn is_active(client_id: String) -> nvim_oxi::Result<(bool, Option<bool>)> {
+fn is_active(client_id: String) -> nvim_oxi::Result<bool> {
+    let client_id = Uuid::parse_str(&client_id).unwrap();
+
+    let registry = WEBSOCKET_CLIENT_REGISTRY.lock();
+    let client = registry.get(&client_id).unwrap();
+    Ok(client.is_active())
+}
+
+fn replay_messages(client_id: String) -> nvim_oxi::Result<()> {
     let client_id = Uuid::parse_str(&client_id).unwrap();
 
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    if let Some(client) = registry.get_mut(&client_id) {
-        Ok((true, Some(client.is_active())))
-    } else {
-        Ok((false, None))
-    }
+    let client = registry.get_mut(&client_id).unwrap();
+    client.replay_messages();
+    Ok(())
 }
 
-fn replay_messages(client_id: String) -> nvim_oxi::Result<bool> {
+fn check_replay_messages(client_id: String) -> nvim_oxi::Result<Vec<String>> {
     let client_id = Uuid::parse_str(&client_id).unwrap();
 
-    let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    if let Some(client) = registry.get_mut(&client_id) {
-        client.replay_messages();
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    let registry = WEBSOCKET_CLIENT_REGISTRY.lock();
+    let client = registry.get(&client_id).unwrap();
+    Ok(client.message_replay_buffer.messages.clone())
 }
 
-fn check_replay_messages(client_id: String) -> nvim_oxi::Result<(bool, Option<Vec<String>>)> {
-    let client_id = Uuid::parse_str(&client_id).unwrap();
-
-    let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    if let Some(client) = registry.get_mut(&client_id) {
-        Ok((true, Some(client.message_replay_buffer.messages.clone())))
-    } else {
-        Ok((false, None))
-    }
+#[derive(Clone)]
+enum WebsocketClientEvent {
+    Connected,
+    Disconnected,
+    Upgraded,
+    NewMessage(String),
 }
-
-// frame_size?: number, on_message: (fun(client: UtilsWebsocketClient, message: string): nil), on_disconnect?: (fun(client: UtilsWebsocketClient): nil), on_connect?: (fun(client: UtilsWebsocketClient): nil), on_upgrade?: (fun(client: UtilsWebsocketClient): nil), headers?: table<string, string>
 
 struct WebsocketClient {
     id: Uuid,
     running: Arc<AtomicBool>,
     message_replay_buffer: MessageReplayBuffer,
-    sender_channel: UnboundedSender<i32>,
+    event_publisher: UnboundedSender<WebsocketClientEvent>,
     handle: AsyncHandle,
 }
 
 impl WebsocketClient {
-    fn new() -> Result<Self, Error> {
+    fn new(client_id: String) -> Result<Self, Box<dyn Error>> {
+        let id = Uuid::parse_str(&client_id)?;
+
+        let callbacks = WebsocketClientCallbacks::new(id)?;
+
         let running = Arc::new(AtomicBool::new(false));
         let running_clone = Arc::clone(&running);
 
-        let (sender, mut receiver) = mpsc::unbounded_channel::<i32>();
+        let (event_publisher, mut event_subscriber) =
+            mpsc::unbounded_channel::<WebsocketClientEvent>();
 
         let handle = AsyncHandle::new(move || {
-            let i = receiver.blocking_recv().unwrap();
+            let event = event_subscriber.blocking_recv().unwrap();
             if !running_clone.load(Ordering::SeqCst) {
-                return Ok::<_, Error>(());
+                return Ok::<_, nvim_oxi::Error>(());
             }
+            let callbacks_clone = callbacks.clone();
             schedule(move |_| {
-                print!("From Rust: Received number {i} from backround thread");
+                match event {
+                    WebsocketClientEvent::Connected => {
+                        if let Some(on_connect) = callbacks_clone.on_connect {
+                            on_connect.call::<_, ()>(())?;
+                        }
+                    }
+                    WebsocketClientEvent::Disconnected => {
+                        if let Some(on_disconnect) = callbacks_clone.on_disconnect {
+                            on_disconnect.call::<_, ()>(())?;
+                        }
+                    }
+                    WebsocketClientEvent::Upgraded => {
+                        if let Some(on_upgrade) = callbacks_clone.on_upgrade {
+                            on_upgrade.call::<_, ()>(())?;
+                        }
+                    }
+                    WebsocketClientEvent::NewMessage(message) => {
+                        if let Some(on_message) = callbacks_clone.on_message {
+                            on_message.call::<_, ()>(message)?;
+                        }
+                    }
+                }
                 Ok(())
             });
-            Ok::<_, Error>(())
+            Ok(())
         })?;
 
         Ok(Self {
-            id: Uuid::new_v4(),
+            id,
             running,
             message_replay_buffer: MessageReplayBuffer::new(),
-            sender_channel: sender,
+            event_publisher,
             handle,
         })
     }
 
     fn connect(&mut self) {
         self.running.store(true, Ordering::SeqCst);
-        let sender_channel = self.sender_channel.clone();
+        let event_publisher = self.event_publisher.clone();
         let handle = self.handle.clone();
         let running = Arc::clone(&self.running);
-        let _ = thread::spawn(move || start_websocket_client(sender_channel, handle, running));
+        let _ = thread::spawn(move || start_websocket_client(event_publisher, handle, running));
     }
 
     fn disconnect(&mut self) {
@@ -188,17 +204,16 @@ impl WebsocketClient {
 
 #[tokio::main]
 async fn start_websocket_client(
-    sender_channel: UnboundedSender<i32>,
+    event_publisher: UnboundedSender<WebsocketClientEvent>,
     handle: AsyncHandle,
     running: Arc<AtomicBool>,
 ) {
-    let mut i = 1;
+    let event_connected = WebsocketClientEvent::Connected;
 
     // https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
     while running.load(Ordering::SeqCst) {
-        sender_channel.send(i).unwrap();
+        event_publisher.send(event_connected.clone()).unwrap();
         handle.send().unwrap();
-        i += 1;
 
         time::sleep(Duration::from_secs(1)).await;
     }
@@ -255,5 +270,30 @@ impl MessageReplayBuffer {
         for message in &self.messages {
             print!("From Rust: {}", message);
         }
+    }
+}
+
+#[derive(Clone)]
+struct WebsocketClientCallbacks<'a> {
+    on_message: Option<LuaFunction<'a>>,
+    on_disconnect: Option<LuaFunction<'a>>,
+    on_connect: Option<LuaFunction<'a>>,
+    on_upgrade: Option<LuaFunction<'a>>,
+}
+
+impl<'a> WebsocketClientCallbacks<'a> {
+    // TODO: possible performance impact by using lua() here?
+    fn new(client_id: Uuid) -> Result<Self, Box<dyn Error>> {
+        let lua = lua();
+        let data_store = lua.globals().get::<_, LuaTable>("_WEBSOCKET_NVIM")?;
+        let all_callbacks = data_store.get::<_, LuaTable>("callbacks")?;
+        let callbacks = all_callbacks.get::<_, LuaTable>(client_id.to_string())?;
+
+        Ok(Self {
+            on_message: callbacks.get::<_, Option<LuaFunction>>("on_message")?,
+            on_disconnect: callbacks.get::<_, Option<LuaFunction>>("on_disconnect")?,
+            on_connect: callbacks.get::<_, Option<LuaFunction>>("on_connect")?,
+            on_upgrade: callbacks.get::<_, Option<LuaFunction>>("on_upgrade")?,
+        })
     }
 }
