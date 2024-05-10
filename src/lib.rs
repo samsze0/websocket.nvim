@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 use std::num::TryFromIntError;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::Duration;
 
@@ -43,7 +47,7 @@ fn websocket_nvim() -> nvim_oxi::Result<Dictionary> {
 
 fn new_client(_: ()) -> nvim_oxi::Result<String> {
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = WebsocketClient::new();
+    let client = WebsocketClient::new()?;
     let client_id = client.id.clone();
     registry.insert(client);
     Ok(client_id.to_string())
@@ -123,32 +127,50 @@ fn check_replay_messages(client_id: String) -> nvim_oxi::Result<(bool, Option<Ve
 
 struct WebsocketClient {
     id: Uuid,
-    running: bool,
+    running: Arc<AtomicBool>,
     message_replay_buffer: MessageReplayBuffer,
     sender_channel: UnboundedSender<i32>,
-    receiver_channel: UnboundedReceiver<i32>,
+    handle: AsyncHandle,
 }
 
 impl WebsocketClient {
-    fn new() -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel::<i32>();
+    fn new() -> Result<Self, Error> {
+        let running = Arc::new(AtomicBool::new(false));
+        let running_clone = Arc::clone(&running);
 
-        Self {
-            // randomly generate a u64 id
+        let (sender, mut receiver) = mpsc::unbounded_channel::<i32>();
+
+        let handle = AsyncHandle::new(move || {
+            let i = receiver.blocking_recv().unwrap();
+            if !running_clone.load(Ordering::SeqCst) {
+                return Ok::<_, Error>(());
+            }
+            schedule(move |_| {
+                print!("From Rust: Received number {i} from backround thread");
+                Ok(())
+            });
+            Ok::<_, Error>(())
+        })?;
+
+        Ok(Self {
             id: Uuid::new_v4(),
-            running: false,
+            running,
             message_replay_buffer: MessageReplayBuffer::new(),
             sender_channel: sender,
-            receiver_channel: receiver,
-        }
+            handle,
+        })
     }
 
     fn connect(&mut self) {
-        self.running = true;
+        self.running.store(true, Ordering::SeqCst);
+        let sender_channel = self.sender_channel.clone();
+        let handle = self.handle.clone();
+        let running = Arc::clone(&self.running);
+        let _ = thread::spawn(move || start_websocket_client(sender_channel, handle, running));
     }
 
     fn disconnect(&mut self) {
-        self.running = false;
+        self.running.store(false, Ordering::SeqCst);
     }
 
     fn send_data(&mut self, data: String) {
@@ -156,11 +178,29 @@ impl WebsocketClient {
     }
 
     fn is_active(&self) -> bool {
-        self.running
+        self.running.load(Ordering::SeqCst)
     }
 
     fn replay_messages(&self) {
         self.message_replay_buffer.replay();
+    }
+}
+
+#[tokio::main]
+async fn start_websocket_client(
+    sender_channel: UnboundedSender<i32>,
+    handle: AsyncHandle,
+    running: Arc<AtomicBool>,
+) {
+    let mut i = 1;
+
+    // https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
+    while running.load(Ordering::SeqCst) {
+        sender_channel.send(i).unwrap();
+        handle.send().unwrap();
+        i += 1;
+
+        time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -217,6 +257,3 @@ impl MessageReplayBuffer {
         }
     }
 }
-
-#[tokio::main]
-async fn start_websocket_client(handle: AsyncHandle, sender: UnboundedSender<i32>) {}
