@@ -19,3 +19,5 @@ uuid = { version = "1.8.0", features = [
     "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
 ] }
 mlua = "0.9.7"
+url = "2.5.0"
+futures-util = "0.3.30"

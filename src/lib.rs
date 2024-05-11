@@ -8,6 +8,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+use futures_util::{future, pin_mut, StreamExt, TryStreamExt};
 use lazy_static::lazy_static;
 use mlua::prelude::*;
 use nvim_oxi::conversion::{Error as ConversionError, FromObject, ToObject};
@@ -16,9 +17,10 @@ use nvim_oxi::serde::{Deserializer, Serializer};
 use nvim_oxi::{api, lua, mlua::lua, print, schedule, Dictionary, Function, Object};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time;
-use tokio_tungstenite::tungstenite::client;
+use url::Url;
 use uuid::Uuid;
 
 lazy_static! {
@@ -47,9 +49,9 @@ fn websocket_nvim() -> nvim_oxi::Result<Dictionary> {
     Ok(api)
 }
 
-fn new_client(client_id: String) -> nvim_oxi::Result<()> {
+fn new_client((client_id, connect_addr): (String, String)) -> nvim_oxi::Result<()> {
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = WebsocketClient::new(client_id).unwrap();
+    let client = WebsocketClient::new(client_id, connect_addr).unwrap();
     registry.insert(client);
     Ok(())
 }
@@ -114,8 +116,30 @@ enum WebsocketClientEvent {
     NewMessage(String),
 }
 
+trait TryFromStr {
+    fn try_from_string(s: String) -> Result<Self, Box<dyn Error>>
+    where
+        Self: Sized;
+}
+
+impl TryFromStr for WebsocketClientEvent {
+    // Blanket implementation already exists, cannot override TryFrom trait's try_from
+    fn try_from_string(s: String) -> Result<Self, Box<dyn Error>> {
+        let parts: Vec<&str> = s.splitn(2, ' ').collect();
+
+        match parts.as_slice() {
+            ["Connected"] => Ok(WebsocketClientEvent::Connected),
+            ["Disconnected"] => Ok(WebsocketClientEvent::Disconnected),
+            ["Upgraded"] => Ok(WebsocketClientEvent::Upgraded),
+            ["NewMessage", message] => Ok(WebsocketClientEvent::NewMessage(message.to_string())),
+            _ => Err("Invalid message".into()),
+        }
+    }
+}
+
 struct WebsocketClient {
     id: Uuid,
+    connect_addr: Url,
     running: Arc<AtomicBool>,
     message_replay_buffer: MessageReplayBuffer,
     event_publisher: UnboundedSender<WebsocketClientEvent>,
@@ -123,7 +147,7 @@ struct WebsocketClient {
 }
 
 impl WebsocketClient {
-    fn new(client_id: String) -> Result<Self, Box<dyn Error>> {
+    fn new(client_id: String, connect_addr: String) -> Result<Self, Box<dyn Error>> {
         let id = Uuid::parse_str(&client_id)?;
 
         let callbacks = WebsocketClientCallbacks::new(id)?;
@@ -170,6 +194,7 @@ impl WebsocketClient {
 
         Ok(Self {
             id,
+            connect_addr: Url::parse(connect_addr.as_str())?,
             running,
             message_replay_buffer: MessageReplayBuffer::new(),
             event_publisher,
@@ -179,10 +204,13 @@ impl WebsocketClient {
 
     fn connect(&mut self) {
         self.running.store(true, Ordering::SeqCst);
+        let connect_addr = self.connect_addr.clone();
         let event_publisher = self.event_publisher.clone();
         let handle = self.handle.clone();
         let running = Arc::clone(&self.running);
-        let _ = thread::spawn(move || start_websocket_client(event_publisher, handle, running));
+        let _ = thread::spawn(move || {
+            start_websocket_client(connect_addr, event_publisher, handle, running)
+        });
     }
 
     fn disconnect(&mut self) {
@@ -204,19 +232,30 @@ impl WebsocketClient {
 
 #[tokio::main]
 async fn start_websocket_client(
+    connect_addr: Url,
     event_publisher: UnboundedSender<WebsocketClientEvent>,
     handle: AsyncHandle,
     running: Arc<AtomicBool>,
 ) {
-    let event_connected = WebsocketClientEvent::Connected;
+    let (ws_stream, response) = tokio_tungstenite::connect_async(connect_addr)
+        .await
+        .expect("Failed to connect");
+    println!("From Rust: WebSocket handshake completed");
 
-    // https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
-    while running.load(Ordering::SeqCst) {
-        event_publisher.send(event_connected.clone()).unwrap();
-        handle.send().unwrap();
+    let (write_stream, read_stream) = ws_stream.split();
 
-        time::sleep(Duration::from_secs(1)).await;
-    }
+    read_stream
+        .for_each(|message| async {
+            let data = message
+                .unwrap()
+                .into_text()
+                .expect("Message received from server is not valid string");
+
+            let event = WebsocketClientEvent::try_from_string(data).expect("Invalid message");
+            event_publisher.send(event).unwrap();
+            handle.send().unwrap();
+        })
+        .await;
 }
 
 struct WebsocketClientRegistry {
