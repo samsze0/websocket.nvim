@@ -1,27 +1,24 @@
 use std::collections::HashMap;
 use std::error::Error;
-use std::num::TryFromIntError;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread;
-use std::time::Duration;
+use std::{env, thread};
 
-use futures_util::{future, pin_mut, StreamExt, TryStreamExt};
+use futures_util::{SinkExt, StreamExt};
 use lazy_static::lazy_static;
 use mlua::prelude::*;
-use nvim_oxi::conversion::{Error as ConversionError, FromObject, ToObject};
-use nvim_oxi::libuv::{AsyncHandle, TimerHandle};
-use nvim_oxi::serde::{Deserializer, Serializer};
-use nvim_oxi::{api, lua, mlua::lua, print, schedule, Dictionary, Function, Object};
+use nvim_oxi::libuv::AsyncHandle;
+use nvim_oxi::{mlua::lua, print, schedule, Dictionary, Function, Object};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::time;
 use url::Url;
 use uuid::Uuid;
+
+use log::{self, debug, info};
+use log4rs::{
+    append::file::FileAppender,
+    config::{Appender, Config, Root},
+    encode::pattern::PatternEncoder,
+};
+use tokio_tungstenite::tungstenite::{self};
 
 lazy_static! {
     static ref WEBSOCKET_CLIENT_REGISTRY: Mutex<WebsocketClientRegistry> =
@@ -30,9 +27,30 @@ lazy_static! {
 
 #[nvim_oxi::module]
 fn websocket_nvim() -> nvim_oxi::Result<Dictionary> {
+    env::set_var("RUST_BACKTRACE", "1");
+
+    let file_appender = FileAppender::builder()
+        // Pattern: https://docs.rs/log4rs/*/log4rs/encode/pattern/index.html
+        .encoder(Box::new(PatternEncoder::new(
+            "[{l}] {d(%Y-%m-%d %H:%M:%S)} {m}\n",
+        )))
+        .build("/tmp/websocket-nvim.log")
+        .expect("Failed to create file appender");
+
+    let log_config = Config::builder()
+        .appender(Appender::builder().build("file", Box::new(file_appender)))
+        .build(
+            Root::builder()
+                .appender("file")
+                .build(log::LevelFilter::Debug),
+        )
+        .expect("Failed to create log config");
+    let _ = log4rs::init_config(log_config).expect("Failed to initialize logger");
+
+    log_panics::init();
+
     let api = Dictionary::from_iter([
         ("new_client", Object::from(Function::from_fn(new_client))),
-        ("connect", Object::from(Function::from_fn(connect))),
         ("disconnect", Object::from(Function::from_fn(disconnect))),
         ("send_data", Object::from(Function::from_fn(send_data))),
         ("is_active", Object::from(Function::from_fn(is_active))),
@@ -49,19 +67,12 @@ fn websocket_nvim() -> nvim_oxi::Result<Dictionary> {
     Ok(api)
 }
 
-fn new_client((client_id, connect_addr): (String, String)) -> nvim_oxi::Result<()> {
+fn new_client(
+    (client_id, connect_addr, extra_headers): (String, String, HashMap<String, String>),
+) -> nvim_oxi::Result<()> {
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = WebsocketClient::new(client_id, connect_addr).unwrap();
+    let client = WebsocketClient::new(client_id, connect_addr, extra_headers).unwrap();
     registry.insert(client);
-    Ok(())
-}
-
-fn connect(client_id: String) -> nvim_oxi::Result<()> {
-    let client_id = Uuid::parse_str(&client_id).unwrap();
-
-    let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = registry.get_mut(&client_id).unwrap();
-    client.connect();
     Ok(())
 }
 
@@ -105,14 +116,13 @@ fn check_replay_messages(client_id: String) -> nvim_oxi::Result<Vec<String>> {
 
     let registry = WEBSOCKET_CLIENT_REGISTRY.lock();
     let client = registry.get(&client_id).unwrap();
-    Ok(client.message_replay_buffer.messages.clone())
+    Ok(client.outbound_message_replay_buffer.messages.clone())
 }
 
 #[derive(Clone)]
-enum WebsocketClientEvent {
+enum WebsocketClientInboundEvent {
     Connected,
     Disconnected,
-    Upgraded,
     NewMessage(String),
 }
 
@@ -122,140 +132,220 @@ trait TryFromStr {
         Self: Sized;
 }
 
-impl TryFromStr for WebsocketClientEvent {
+impl TryFromStr for WebsocketClientInboundEvent {
     // Blanket implementation already exists, cannot override TryFrom trait's try_from
     fn try_from_string(s: String) -> Result<Self, Box<dyn Error>> {
-        let parts: Vec<&str> = s.splitn(2, ' ').collect();
-
-        match parts.as_slice() {
-            ["Connected"] => Ok(WebsocketClientEvent::Connected),
-            ["Disconnected"] => Ok(WebsocketClientEvent::Disconnected),
-            ["Upgraded"] => Ok(WebsocketClientEvent::Upgraded),
-            ["NewMessage", message] => Ok(WebsocketClientEvent::NewMessage(message.to_string())),
-            _ => Err("Invalid message".into()),
-        }
+        Ok(WebsocketClientInboundEvent::NewMessage(s))
     }
 }
 
 struct WebsocketClient {
     id: Uuid,
     connect_addr: Url,
-    running: Arc<AtomicBool>,
-    message_replay_buffer: MessageReplayBuffer,
-    event_publisher: UnboundedSender<WebsocketClientEvent>,
-    handle: AsyncHandle,
+    extra_headers: HashMap<String, String>,
+    running: bool,
+    running_publisher: UnboundedSender<bool>,
+    outbound_message_replay_buffer: OutboundMessageReplayBuffer,
+    outbound_message_publisher: UnboundedSender<String>,
+    inbound_event_publisher: UnboundedSender<WebsocketClientInboundEvent>,
+    inbound_event_handler: AsyncHandle,
 }
 
 impl WebsocketClient {
-    fn new(client_id: String, connect_addr: String) -> Result<Self, Box<dyn Error>> {
+    fn new(
+        client_id: String,
+        connect_addr: String,
+        extra_headers: HashMap<String, String>,
+    ) -> Result<Self, Box<dyn Error>> {
         let id = Uuid::parse_str(&client_id)?;
+
+        let connect_addr = Url::parse(connect_addr.as_str())?;
 
         let callbacks = WebsocketClientCallbacks::new(id)?;
 
-        let running = Arc::new(AtomicBool::new(false));
-        let running_clone = Arc::clone(&running);
+        let mut running = false;
 
-        let (event_publisher, mut event_subscriber) =
-            mpsc::unbounded_channel::<WebsocketClientEvent>();
+        let (inbound_event_publisher, mut inbound_event_receiver) =
+            mpsc::unbounded_channel::<WebsocketClientInboundEvent>();
 
-        let handle = AsyncHandle::new(move || {
-            let event = event_subscriber.blocking_recv().unwrap();
-            if !running_clone.load(Ordering::SeqCst) {
-                return Ok::<_, nvim_oxi::Error>(());
-            }
+        let (outbound_message_publisher, outbound_message_receiver) =
+            mpsc::unbounded_channel::<String>();
+
+        let (running_publisher, running_subscriber) = mpsc::unbounded_channel::<bool>();
+
+        let inbound_event_handler = AsyncHandle::new(move || {
+            let event = inbound_event_receiver.blocking_recv().unwrap();
             let callbacks_clone = callbacks.clone();
             schedule(move |_| {
                 match event {
-                    WebsocketClientEvent::Connected => {
+                    WebsocketClientInboundEvent::Connected => {
                         if let Some(on_connect) = callbacks_clone.on_connect {
-                            on_connect.call::<_, ()>(())?;
+                            on_connect.call::<_, ()>(id.to_string())?;
                         }
                     }
-                    WebsocketClientEvent::Disconnected => {
+                    WebsocketClientInboundEvent::Disconnected => {
                         if let Some(on_disconnect) = callbacks_clone.on_disconnect {
-                            on_disconnect.call::<_, ()>(())?;
+                            on_disconnect.call::<_, ()>(id.to_string())?;
                         }
                     }
-                    WebsocketClientEvent::Upgraded => {
-                        if let Some(on_upgrade) = callbacks_clone.on_upgrade {
-                            on_upgrade.call::<_, ()>(())?;
-                        }
-                    }
-                    WebsocketClientEvent::NewMessage(message) => {
+                    WebsocketClientInboundEvent::NewMessage(message) => {
                         if let Some(on_message) = callbacks_clone.on_message {
-                            on_message.call::<_, ()>(message)?;
+                            on_message.call::<_, ()>((id.to_string(), message))?;
                         }
                     }
                 }
                 Ok(())
             });
-            Ok(())
+            Ok::<_, nvim_oxi::Error>(())
         })?;
+
+        #[tokio::main]
+        async fn start_websocket_client(
+            connect_addr: Url,
+            extra_headers: HashMap<String, String>,
+            inbound_event_publisher: UnboundedSender<WebsocketClientInboundEvent>,
+            inbound_event_handler: AsyncHandle,
+            mut running_subscriber: UnboundedReceiver<bool>,
+            mut outbound_message_receiver: UnboundedReceiver<String>,
+        ) {
+            let default_port = match connect_addr.scheme() {
+                "ws" => 80,
+                "wss" => 443,
+                _ => 80,
+            };
+            let mut request = tungstenite::http::Request::builder()
+                .header(
+                    "Host",
+                    format!(
+                        "{}:{}",
+                        connect_addr.host_str().unwrap(),
+                        connect_addr.port().unwrap_or(default_port)
+                    ),
+                )
+                .header(
+                    "Sec-WebSocket-Key",
+                    tungstenite::handshake::client::generate_key(),
+                )
+                .header("Upgrade", "Websocket")
+                .header("Connection", "Upgrade")
+                .header("Sec-WebSocket-Version", 13)
+                .uri(connect_addr.as_str())
+                .body(())
+                .unwrap();
+
+            for (key, value) in extra_headers {
+                debug!("Adding header: {}={}", key, value);
+
+                // https://stackoverflow.com/questions/23975391/how-to-convert-a-string-into-a-static-str
+                let key_static_ref: &'static str = key.leak();
+                let value_static_ref: &'static str = value.leak();
+                request.headers_mut().insert(
+                    key_static_ref,
+                    tungstenite::http::HeaderValue::from_static(value_static_ref),
+                );
+            }
+
+            let (ws_stream, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+            info!("{} WebSocket handshake completed", connect_addr.as_str());
+            inbound_event_publisher.send(WebsocketClientInboundEvent::Connected).unwrap();
+            inbound_event_handler.send().unwrap();
+
+            let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+            loop {
+                tokio::select! {
+                    message = ws_receiver.next() => {
+                        match message {
+                            Some(message) => {
+                                let message = message.unwrap();
+                                if message.is_text() {
+                                    let data = message.into_text().expect("Message received from server is not valid string");
+                                    let event = WebsocketClientInboundEvent::try_from_string(data).unwrap();
+                                    inbound_event_publisher.send(event).unwrap();
+                                    inbound_event_handler.send().unwrap();
+                                } else if message.is_binary() {
+                                    panic!("Binary data is not supported")
+                                } else if message.is_close() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    running = running_subscriber.recv() => {
+                        match running {
+                            Some(running) => {
+                                if !running {
+                                    break;
+                                }
+                            }
+                            None => (),
+                        }
+                    }
+                    message = outbound_message_receiver.recv() => {
+                        match message {
+                            Some(message) => {
+                                ws_sender.send(tungstenite::Message::Text(message)).await.unwrap();
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+
+            inbound_event_publisher.send(WebsocketClientInboundEvent::Disconnected).unwrap();
+            inbound_event_handler.send().unwrap();
+        }
+
+        let connect_addr_clone = connect_addr.clone();
+        let extra_headers_clone = extra_headers.clone();
+        let inbound_event_publisher_clone = inbound_event_publisher.clone();
+        let inbound_event_handler_clone = inbound_event_handler.clone();
+
+        running = true;
+        running_publisher.send(true).unwrap();
+        let handle = thread::spawn(move || {
+            start_websocket_client(
+                connect_addr_clone,
+                extra_headers_clone,
+                inbound_event_publisher_clone,
+                inbound_event_handler_clone,
+                running_subscriber,
+                outbound_message_receiver,
+            )
+        });
 
         Ok(Self {
             id,
-            connect_addr: Url::parse(connect_addr.as_str())?,
+            connect_addr,
+            extra_headers,
             running,
-            message_replay_buffer: MessageReplayBuffer::new(),
-            event_publisher,
-            handle,
+            running_publisher,
+            outbound_message_replay_buffer: OutboundMessageReplayBuffer::new(),
+            outbound_message_publisher,
+            inbound_event_publisher,
+            inbound_event_handler,
         })
-    }
-
-    fn connect(&mut self) {
-        self.running.store(true, Ordering::SeqCst);
-        let connect_addr = self.connect_addr.clone();
-        let event_publisher = self.event_publisher.clone();
-        let handle = self.handle.clone();
-        let running = Arc::clone(&self.running);
-        let _ = thread::spawn(move || {
-            start_websocket_client(connect_addr, event_publisher, handle, running)
-        });
     }
 
     fn disconnect(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
+        self.running = false;
+        self.running_publisher
+            .send(false)
+            .expect("Failed to stop client");
     }
 
     fn send_data(&mut self, data: String) {
-        self.message_replay_buffer.add(data);
+        self.outbound_message_replay_buffer.add(data);
     }
 
     fn is_active(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.running
     }
 
     fn replay_messages(&self) {
-        self.message_replay_buffer.replay();
+        self.outbound_message_replay_buffer.replay();
     }
-}
-
-#[tokio::main]
-async fn start_websocket_client(
-    connect_addr: Url,
-    event_publisher: UnboundedSender<WebsocketClientEvent>,
-    handle: AsyncHandle,
-    running: Arc<AtomicBool>,
-) {
-    let (ws_stream, response) = tokio_tungstenite::connect_async(connect_addr)
-        .await
-        .expect("Failed to connect");
-    println!("From Rust: WebSocket handshake completed");
-
-    let (write_stream, read_stream) = ws_stream.split();
-
-    read_stream
-        .for_each(|message| async {
-            let data = message
-                .unwrap()
-                .into_text()
-                .expect("Message received from server is not valid string");
-
-            let event = WebsocketClientEvent::try_from_string(data).expect("Invalid message");
-            event_publisher.send(event).unwrap();
-            handle.send().unwrap();
-        })
-        .await;
 }
 
 struct WebsocketClientRegistry {
@@ -290,11 +380,11 @@ impl WebsocketClientRegistry {
     }
 }
 
-struct MessageReplayBuffer {
+struct OutboundMessageReplayBuffer {
     messages: Vec<String>,
 }
 
-impl MessageReplayBuffer {
+impl OutboundMessageReplayBuffer {
     fn new() -> Self {
         Self {
             messages: Vec::new(),
@@ -317,7 +407,6 @@ struct WebsocketClientCallbacks<'a> {
     on_message: Option<LuaFunction<'a>>,
     on_disconnect: Option<LuaFunction<'a>>,
     on_connect: Option<LuaFunction<'a>>,
-    on_upgrade: Option<LuaFunction<'a>>,
 }
 
 impl<'a> WebsocketClientCallbacks<'a> {
@@ -332,7 +421,6 @@ impl<'a> WebsocketClientCallbacks<'a> {
             on_message: callbacks.get::<_, Option<LuaFunction>>("on_message")?,
             on_disconnect: callbacks.get::<_, Option<LuaFunction>>("on_disconnect")?,
             on_connect: callbacks.get::<_, Option<LuaFunction>>("on_connect")?,
-            on_upgrade: callbacks.get::<_, Option<LuaFunction>>("on_upgrade")?,
         })
     }
 }
