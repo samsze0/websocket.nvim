@@ -7,7 +7,8 @@ _G["_WEBSOCKET_NVIM"] = {
     callbacks = {}
 }
 
-vim.opt.runtimepath:append(vim.fn.expand("%:h") .. "../../rust")
+local current_path = debug.getinfo(1).source:match("@?(.*/)")
+vim.opt.runtimepath:append(current_path .. "../../rust")
 local websocket_ffi = require("websocket_ffi")
 
 print(vim.inspect(websocket_ffi))
