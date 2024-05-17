@@ -1,7 +1,7 @@
 local WebsocketClient = require("websocket.client").WebsocketClient
 
 local client = WebsocketClient.new({
-    connect_addr = "ws://localhost:8080",
+    connect_addr = "ws://localhost:12010",
     on_message = function(message)
         print("Received message: " .. message)
     end,
@@ -17,7 +17,7 @@ client:connect()
 
 -- Schedule to run in 2 seconds
 vim.defer_fn(function()
-  client:send("Hello server")
+  client:send_data("Hello server")
 end, 5000)
 
 -- Schedule to run in 5 seconds
