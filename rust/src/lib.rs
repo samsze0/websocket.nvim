@@ -5,6 +5,7 @@ use std::{env, thread};
 use futures_util::{SinkExt, StreamExt};
 use lazy_static::lazy_static;
 use mlua::prelude::*;
+use nvim_oxi::conversion::ToObject;
 use nvim_oxi::libuv::AsyncHandle;
 use nvim_oxi::{mlua::lua, print, schedule, Dictionary, Function, Object};
 use parking_lot::Mutex;
@@ -120,12 +121,49 @@ fn check_replay_messages(client_id: String) -> nvim_oxi::Result<Vec<String>> {
 }
 
 #[derive(Clone)]
+enum WebsocketClientError {
+    ConnectionError(String),
+    DisconnectionError(String),
+    MessageError(String),
+}
+
+#[derive(Clone)]
 enum WebsocketClientInboundEvent {
     Connected,
     Disconnected,
     NewMessage(String),
+    Error(WebsocketClientError),
 }
 
+// Not necessary (for now)
+impl ToObject for WebsocketClientError {
+    fn to_object(self) -> Result<Object, nvim_oxi::conversion::Error> {
+        match self {
+            WebsocketClientError::ConnectionError(message) => Ok(Object::from(message)),
+            WebsocketClientError::DisconnectionError(message) => Ok(Object::from(message)),
+            WebsocketClientError::MessageError(message) => Ok(Object::from(message)),
+        }
+    }
+}
+
+impl<'lua> IntoLua<'lua> for WebsocketClientError {
+    fn into_lua(self, lua: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
+        let vec = match self {
+            WebsocketClientError::ConnectionError(message) => {
+                vec![("type", "connection_error"), ("message", message.leak())]
+            }
+            WebsocketClientError::DisconnectionError(message) => {
+                vec![("type", "disconnection_error"), ("message", message.leak())]
+            }
+            WebsocketClientError::MessageError(message) => {
+                vec![("type", "message_error"), ("message", message.leak())]
+            }
+        };
+        Ok(LuaValue::Table(lua.create_table_from(vec)?))
+    }
+}
+
+// Unnecessary trait. Could have just wrap the received message in an enum instead
 trait TryFromStr {
     fn try_from_string(s: String) -> Result<Self, Box<dyn Error>>
     where
@@ -193,6 +231,11 @@ impl WebsocketClient {
                             on_message.call::<_, ()>((id.to_string(), message))?;
                         }
                     }
+                    WebsocketClientInboundEvent::Error(error) => {
+                        if let Some(on_error) = callbacks_clone.on_error {
+                            on_error.call::<_, ()>((id.to_string(), error))?;
+                        }
+                    }
                 }
                 Ok(())
             });
@@ -231,6 +274,14 @@ impl WebsocketClient {
                 .header("Sec-WebSocket-Version", 13)
                 .uri(connect_addr.as_str())
                 .body(())
+                .map_err(|err| {
+                    inbound_event_publisher
+                        .send(WebsocketClientInboundEvent::Error(
+                            WebsocketClientError::ConnectionError(err.to_string()),
+                        ))
+                        .unwrap();
+                    err
+                })
                 .unwrap();
 
             for (key, value) in extra_headers {
@@ -245,9 +296,21 @@ impl WebsocketClient {
                 );
             }
 
-            let (ws_stream, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+            let (ws_stream, response) = tokio_tungstenite::connect_async(request)
+                .await
+                .map_err(|err| {
+                    inbound_event_publisher
+                        .send(WebsocketClientInboundEvent::Error(
+                            WebsocketClientError::ConnectionError(err.to_string()),
+                        ))
+                        .unwrap();
+                    err
+                })
+                .unwrap();
             info!("{} WebSocket handshake completed", connect_addr.as_str());
-            inbound_event_publisher.send(WebsocketClientInboundEvent::Connected).unwrap();
+            inbound_event_publisher
+                .send(WebsocketClientInboundEvent::Connected)
+                .unwrap();
             inbound_event_handler.send().unwrap();
 
             let (mut ws_sender, mut ws_receiver) = ws_stream.split();
@@ -260,10 +323,13 @@ impl WebsocketClient {
                                 let message = message.unwrap();
                                 if message.is_text() {
                                     let data = message.into_text().expect("Message received from server is not valid string");
-                                    let event = WebsocketClientInboundEvent::try_from_string(data).unwrap();
+                                    let event = WebsocketClientInboundEvent::NewMessage(data);
                                     inbound_event_publisher.send(event).unwrap();
                                     inbound_event_handler.send().unwrap();
                                 } else if message.is_binary() {
+                                    inbound_event_publisher
+                                        .send(WebsocketClientInboundEvent::Error(WebsocketClientError::MessageError("Binary data is not supported".to_string())))
+                                        .unwrap();
                                     panic!("Binary data is not supported")
                                 } else if message.is_close() {
                                     break;
@@ -293,7 +359,9 @@ impl WebsocketClient {
                 }
             }
 
-            inbound_event_publisher.send(WebsocketClientInboundEvent::Disconnected).unwrap();
+            inbound_event_publisher
+                .send(WebsocketClientInboundEvent::Disconnected)
+                .unwrap();
             inbound_event_handler.send().unwrap();
         }
 
@@ -407,6 +475,7 @@ struct WebsocketClientCallbacks<'a> {
     on_message: Option<LuaFunction<'a>>,
     on_disconnect: Option<LuaFunction<'a>>,
     on_connect: Option<LuaFunction<'a>>,
+    on_error: Option<LuaFunction<'a>>,
 }
 
 impl<'a> WebsocketClientCallbacks<'a> {
@@ -421,6 +490,7 @@ impl<'a> WebsocketClientCallbacks<'a> {
             on_message: callbacks.get::<_, Option<LuaFunction>>("on_message")?,
             on_disconnect: callbacks.get::<_, Option<LuaFunction>>("on_disconnect")?,
             on_connect: callbacks.get::<_, Option<LuaFunction>>("on_connect")?,
+            on_error: callbacks.get::<_, Option<LuaFunction>>("on_error")?,
         })
     }
 }
