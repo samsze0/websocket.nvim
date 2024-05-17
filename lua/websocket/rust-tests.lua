@@ -14,9 +14,7 @@ local websocket_ffi = require("websocket_ffi")
 print("FFI", vim.inspect(websocket_ffi))
 local client_id = utils.uuid()
 _G["_WEBSOCKET_NVIM"].callbacks[client_id] = {
-    on_message = function(args)
-        local client_id = args[1]
-        local message = args[2]
+    on_message = function(client_id, message)
         print("Callback: Received message", message)
     end,
     on_disconnect = function(client_id)
@@ -36,10 +34,7 @@ websocket_ffi.connect(client_id, string.format("ws://localhost:%d", PORT), {
 local is_active = websocket_ffi.is_active(client_id)
 print("Is active", is_active)
 
-websocket_ffi.send_data(client_id, "Hello, world!")
-
-local messages = websocket_ffi.check_replay_messages(client_id)
-print(vim.inspect(messages))
+websocket_ffi.send_data(client_id, "pos(3)+websocket-broadcast@Hi from server@")
 
 -- Schedule to run in 5 seconds
 vim.defer_fn(function()

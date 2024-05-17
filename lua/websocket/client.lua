@@ -53,13 +53,11 @@ end
 -- Connect to the websocket server
 function WebsocketClient:connect()
 	_G["_WEBSOCKET_NVIM"].callbacks[self.client_id] = {
-		on_message = function(args)
-			local client_id = args[1]
+		on_message = function(client_id, message)
 			local client = WebsocketClientMap[client_id]
 			if not client then
 				error("Received message but client not found", client_id)
 			end
-			local message = args[2]
 
 			client.on_message(message)
 		end,

@@ -337,6 +337,7 @@ impl WebsocketClient {
                                 let message = message.unwrap();
                                 if message.is_text() {
                                     let data = message.into_text().expect("Message received from server is not valid string");
+                                    info!("Received message: {}", data);
                                     let event = WebsocketClientInboundEvent::NewMessage(data);
                                     inbound_event_publisher.send(event).unwrap();
                                     inbound_event_handler.send().unwrap();

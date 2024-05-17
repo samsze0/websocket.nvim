@@ -1,7 +1,10 @@
 local WebsocketClient = require("websocket.client").WebsocketClient
 
+local PORT = 12010
+local FZF_API_KEY = "test"
+
 local client = WebsocketClient.new({
-    connect_addr = "ws://localhost:12010",
+    connect_addr = ("ws://localhost:%d"):format(PORT),
     on_message = function(message)
         print("Received message: " .. message)
     end,
@@ -13,14 +16,17 @@ local client = WebsocketClient.new({
     end,
     on_error = function(err)
         print("On error", vim.inspect(err))
-    end
+    end,
+    extra_headers = {
+        ["Fzf-Api-Key"] = FZF_API_KEY
+    }
 })
 
 client:connect()
 
 -- Schedule to run in 2 seconds
 vim.defer_fn(function()
-  client:send_data("Hello server")
+  client:send_data("pos(3)+websocket-broadcast@Hi from server@")
 end, 2000)
 
 -- Schedule to run in 5 seconds
