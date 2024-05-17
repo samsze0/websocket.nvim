@@ -51,7 +51,10 @@ fn websocket_ffi() -> nvim_oxi::Result<Dictionary> {
     log_panics::init();
 
     let api = Dictionary::from_iter([
-        ("connect", Object::from(Function::from_fn(new_client))),
+        (
+            "connect",
+            Object::from(Function::from_fn(create_client_and_connect)),
+        ),
         ("disconnect", Object::from(Function::from_fn(disconnect))),
         ("send_data", Object::from(Function::from_fn(send_data))),
         ("is_active", Object::from(Function::from_fn(is_active))),
@@ -68,7 +71,7 @@ fn websocket_ffi() -> nvim_oxi::Result<Dictionary> {
     Ok(api)
 }
 
-fn new_client(
+fn create_client_and_connect(
     (client_id, connect_addr, extra_headers): (String, String, HashMap<String, String>),
 ) -> nvim_oxi::Result<()> {
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
@@ -125,6 +128,7 @@ enum WebsocketClientError {
     ConnectionError(String),
     DisconnectionError(String),
     MessageError(String),
+    SendMessageError(String),
 }
 
 #[derive(Clone)]
@@ -142,6 +146,7 @@ impl ToObject for WebsocketClientError {
             WebsocketClientError::ConnectionError(message) => Ok(Object::from(message)),
             WebsocketClientError::DisconnectionError(message) => Ok(Object::from(message)),
             WebsocketClientError::MessageError(message) => Ok(Object::from(message)),
+            WebsocketClientError::SendMessageError(message) => Ok(Object::from(message)),
         }
     }
 }
@@ -157,6 +162,9 @@ impl<'lua> IntoLua<'lua> for WebsocketClientError {
             }
             WebsocketClientError::MessageError(message) => {
                 vec![("type", "message_error"), ("message", message.leak())]
+            }
+            WebsocketClientError::SendMessageError(message) => {
+                vec![("type", "send_message_error"), ("message", message.leak())]
             }
         };
         Ok(LuaValue::Table(lua.create_table_from(vec)?))
@@ -183,6 +191,7 @@ struct WebsocketClient {
     extra_headers: HashMap<String, String>,
     running: bool,
     running_publisher: UnboundedSender<bool>,
+    // Currently not used. In the future we want to support appending data to the send queue with or without connection established
     outbound_message_replay_buffer: OutboundMessageReplayBuffer,
     outbound_message_publisher: UnboundedSender<String>,
     inbound_event_publisher: UnboundedSender<WebsocketClientInboundEvent>,
@@ -280,6 +289,7 @@ impl WebsocketClient {
                             WebsocketClientError::ConnectionError(err.to_string()),
                         ))
                         .unwrap();
+                    inbound_event_handler.send().unwrap();
                     err
                 })
                 .unwrap();
@@ -304,6 +314,7 @@ impl WebsocketClient {
                             WebsocketClientError::ConnectionError(err.to_string()),
                         ))
                         .unwrap();
+                    inbound_event_handler.send().unwrap();
                     err
                 })
                 .unwrap();
@@ -330,6 +341,7 @@ impl WebsocketClient {
                                     inbound_event_publisher
                                         .send(WebsocketClientInboundEvent::Error(WebsocketClientError::MessageError("Binary data is not supported".to_string())))
                                         .unwrap();
+                                    inbound_event_handler.send().unwrap();
                                     panic!("Binary data is not supported")
                                 } else if message.is_close() {
                                     break;
@@ -398,13 +410,35 @@ impl WebsocketClient {
 
     fn disconnect(&mut self) {
         self.running = false;
+        let inbound_event_publisher = self.inbound_event_publisher.clone();
+        let inbound_event_handler = self.inbound_event_handler.clone();
         self.running_publisher
             .send(false)
-            .expect("Failed to stop client");
+            .unwrap_or_else(move |err| {
+                inbound_event_publisher
+                    .send(WebsocketClientInboundEvent::Error(
+                        WebsocketClientError::DisconnectionError(err.to_string()),
+                    ))
+                    .unwrap();
+                inbound_event_handler.send().unwrap();
+                ()
+            });
     }
 
     fn send_data(&mut self, data: String) {
-        self.outbound_message_replay_buffer.add(data);
+        let inbound_event_publisher = self.inbound_event_publisher.clone();
+        let inbound_event_handler = self.inbound_event_handler.clone();
+        self.outbound_message_publisher
+            .send(data)
+            .unwrap_or_else(move |err| {
+                inbound_event_publisher
+                    .send(WebsocketClientInboundEvent::Error(
+                        WebsocketClientError::DisconnectionError(err.to_string()),
+                    ))
+                    .unwrap();
+                inbound_event_handler.send().unwrap();
+                ()
+            });
     }
 
     fn is_active(&self) -> bool {
