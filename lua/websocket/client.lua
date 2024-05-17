@@ -27,7 +27,7 @@ function WebsocketClient.new(opts)
 	local obj = {
 		client_id = client_id,
 		connect_addr = opts.connect_addr,
-		extra_headers = opts.extra_headers,
+		extra_headers = opts.extra_headers or {},
 		on_message = opts.on_message,
 		on_disconnect = opts.on_disconnect,
 		on_connect = opts.on_connect,
@@ -56,7 +56,7 @@ function WebsocketClient:connect()
 				error("Disconnected but client not found", client_id)
 			end
 
-      WebsocketClientMap[client_id] = nil
+      		WebsocketClientMap[client_id] = nil
 
 			if client.on_disconnect then
 				client.on_disconnect()
