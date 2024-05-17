@@ -1,4 +1,4 @@
-local websocket_ffi = require("websocket_ffi")
+local websocket_client_ffi = require("websocket_ffi").client
 local utils = require("utils")
 
 local M = {}
@@ -52,7 +52,7 @@ end
 
 -- Connect to the websocket server
 function WebsocketClient:connect()
-	_G["_WEBSOCKET_NVIM"].callbacks[self.client_id] = {
+	_G["_WEBSOCKET_NVIM"].clients.callbacks[self.client_id] = {
 		on_message = function(client_id, message)
 			local client = WebsocketClientMap[client_id]
 			if not client then
@@ -94,26 +94,26 @@ function WebsocketClient:connect()
 			end
 		end,
 	}
-	websocket_ffi.connect(self.client_id, self.connect_addr, self.extra_headers)
+	websocket_client_ffi.connect(self.client_id, self.connect_addr, self.extra_headers)
 end
 
 -- Check if the websocket client is active
 --
 ---@return boolean
 function WebsocketClient:is_active()
-	return websocket_ffi.is_active(self.client_id)
+	return websocket_client_ffi.is_active(self.client_id)
 end
 
 -- Send data to the websocket server
 --
 ---@param data string
 function WebsocketClient:send_data(data)
-	websocket_ffi.send_data(self.client_id, data)
+	websocket_client_ffi.send_data(self.client_id, data)
 end
 
 -- Disconnect from the websocket server
 function WebsocketClient:disconnect()
-	websocket_ffi.disconnect(self.client_id)
+	websocket_client_ffi.disconnect(self.client_id)
 end
 
 return M

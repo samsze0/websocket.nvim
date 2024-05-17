@@ -4,16 +4,18 @@ local PORT = 12010
 local FZF_API_KEY = "test"
 
 _G["_WEBSOCKET_NVIM"] = {
-    callbacks = {}
+    clients = {
+        callbacks = {}
+    }
 }
 
 local current_path = debug.getinfo(1).source:match("@?(.*/)")
 vim.opt.runtimepath:append(current_path .. "../../rust")
-local websocket_ffi = require("websocket_ffi")
+local websocket_client_ffi = require("websocket_ffi").client
 
-print("FFI", vim.inspect(websocket_ffi))
+print("FFI", vim.inspect(websocket_client_ffi))
 local client_id = utils.uuid()
-_G["_WEBSOCKET_NVIM"].callbacks[client_id] = {
+_G["_WEBSOCKET_NVIM"].clients.callbacks[client_id] = {
     on_message = function(client_id, message)
         print("Callback: Received message", message)
     end,
@@ -27,16 +29,16 @@ _G["_WEBSOCKET_NVIM"].callbacks[client_id] = {
         print("Callback: Error", vim.inspect(error))
     end
 }
-websocket_ffi.connect(client_id, string.format("ws://localhost:%d", PORT), {
+websocket_client_ffi.connect(client_id, string.format("ws://localhost:%d", PORT), {
     ["Fzf-Api-Key"] = FZF_API_KEY
 })
 
-local is_active = websocket_ffi.is_active(client_id)
+local is_active = websocket_client_ffi.is_active(client_id)
 print("Is active", is_active)
 
-websocket_ffi.send_data(client_id, "pos(3)+websocket-broadcast@Hi from server@")
+websocket_client_ffi.send_data(client_id, "pos(3)+websocket-broadcast@Hi from server@")
 
 -- Schedule to run in 5 seconds
 vim.defer_fn(function()
-  websocket_ffi.disconnect(client_id)
+  websocket_client_ffi.disconnect(client_id)
 end, 5000)
