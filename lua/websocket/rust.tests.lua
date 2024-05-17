@@ -1,4 +1,4 @@
-local utils = require("samsze0-utils-nvim")
+local utils = require("utils")
 
 local PORT = 12010
 local FZF_API_KEY = "test"
@@ -7,10 +7,10 @@ _G["_WEBSOCKET_NVIM"] = {
     callbacks = {}
 }
 
-vim.cmd("set rtp+=./rust")
-local websocket = require("websocket_nvim")
+vim.opt.runtimepath:append(vim.fn.expand("%:h") .. "../../rust")
+local websocket_ffi = require("websocket_ffi")
 
-print(vim.inspect(websocket))
+print(vim.inspect(websocket_ffi))
 local client_id = utils.uuid()
 _G["_WEBSOCKET_NVIM"].callbacks[client_id] = {
     on_message = function(args)
@@ -25,20 +25,20 @@ _G["_WEBSOCKET_NVIM"].callbacks[client_id] = {
         print("Callback: Connected to", client_id)
     end,
 }
-websocket.new_client(client_id, string.format("ws://localhost:%d", PORT), {
+websocket_ffi.connect(client_id, string.format("ws://localhost:%d", PORT), {
     ["Fzf-Api-Key"] = FZF_API_KEY
 })
 print(vim.inspect(client_id))
 
-local is_active = websocket.is_active(client_id)
+local is_active = websocket_ffi.is_active(client_id)
 print("Is active", is_active)
 
-websocket.send_data(client_id, "Hello, world!")
+websocket_ffi.send_data(client_id, "Hello, world!")
 
-local messages = websocket.check_replay_messages(client_id)
+local messages = websocket_ffi.check_replay_messages(client_id)
 print(vim.inspect(messages))
 
 -- Schedule to run in 5 seconds
 vim.defer_fn(function()
-  websocket.disconnect(client_id)
+  websocket_ffi.disconnect(client_id)
 end, 5000)

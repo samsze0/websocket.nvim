@@ -26,7 +26,7 @@ lazy_static! {
 }
 
 #[nvim_oxi::module]
-fn websocket_nvim() -> nvim_oxi::Result<Dictionary> {
+fn websocket_ffi() -> nvim_oxi::Result<Dictionary> {
     env::set_var("RUST_BACKTRACE", "1");
 
     let file_appender = FileAppender::builder()
@@ -50,7 +50,7 @@ fn websocket_nvim() -> nvim_oxi::Result<Dictionary> {
     log_panics::init();
 
     let api = Dictionary::from_iter([
-        ("new_client", Object::from(Function::from_fn(new_client))),
+        ("connect", Object::from(Function::from_fn(new_client))),
         ("disconnect", Object::from(Function::from_fn(disconnect))),
         ("send_data", Object::from(Function::from_fn(send_data))),
         ("is_active", Object::from(Function::from_fn(is_active))),
