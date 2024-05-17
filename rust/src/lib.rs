@@ -127,7 +127,7 @@ fn check_replay_messages(client_id: String) -> nvim_oxi::Result<Vec<String>> {
 enum WebsocketClientError {
     ConnectionError(String),
     DisconnectionError(String),
-    MessageError(String),
+    ReceiveMessageError(String),
     SendMessageError(String),
 }
 
@@ -145,7 +145,7 @@ impl ToObject for WebsocketClientError {
         match self {
             WebsocketClientError::ConnectionError(message) => Ok(Object::from(message)),
             WebsocketClientError::DisconnectionError(message) => Ok(Object::from(message)),
-            WebsocketClientError::MessageError(message) => Ok(Object::from(message)),
+            WebsocketClientError::ReceiveMessageError(message) => Ok(Object::from(message)),
             WebsocketClientError::SendMessageError(message) => Ok(Object::from(message)),
         }
     }
@@ -160,8 +160,11 @@ impl<'lua> IntoLua<'lua> for WebsocketClientError {
             WebsocketClientError::DisconnectionError(message) => {
                 vec![("type", "disconnection_error"), ("message", message.leak())]
             }
-            WebsocketClientError::MessageError(message) => {
-                vec![("type", "message_error"), ("message", message.leak())]
+            WebsocketClientError::ReceiveMessageError(message) => {
+                vec![
+                    ("type", "receive_message_error"),
+                    ("message", message.leak()),
+                ]
             }
             WebsocketClientError::SendMessageError(message) => {
                 vec![("type", "send_message_error"), ("message", message.leak())]
@@ -339,7 +342,7 @@ impl WebsocketClient {
                                     inbound_event_handler.send().unwrap();
                                 } else if message.is_binary() {
                                     inbound_event_publisher
-                                        .send(WebsocketClientInboundEvent::Error(WebsocketClientError::MessageError("Binary data is not supported".to_string())))
+                                        .send(WebsocketClientInboundEvent::Error(WebsocketClientError::ReceiveMessageError("Binary data is not supported".to_string())))
                                         .unwrap();
                                     inbound_event_handler.send().unwrap();
                                     panic!("Binary data is not supported")
@@ -433,7 +436,7 @@ impl WebsocketClient {
             .unwrap_or_else(move |err| {
                 inbound_event_publisher
                     .send(WebsocketClientInboundEvent::Error(
-                        WebsocketClientError::DisconnectionError(err.to_string()),
+                        WebsocketClientError::SendMessageError(err.to_string()),
                     ))
                     .unwrap();
                 inbound_event_handler.send().unwrap();

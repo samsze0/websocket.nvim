@@ -10,6 +10,7 @@ local M = {}
 ---@field on_message fun(message: string)
 ---@field on_disconnect fun()
 ---@field on_connect fun()
+---@field on_error fun(err: WebsocketClientError)
 local WebsocketClient = {}
 WebsocketClient.__index = WebsocketClient
 WebsocketClient.__is_class = true
@@ -18,9 +19,20 @@ M.WebsocketClient = WebsocketClient
 ---@type table<string, WebsocketClient>
 local WebsocketClientMap = {}
 
+---@enum WebsocketClientErrorType
+local ErrorType = {
+	ConnectionError = "connection_error",
+	DisconnectionError = "disconnection_error",
+	ReceiveMessageError = "receive_message_error",
+	SendMessageError = "send_message_error"
+}
+M.ErrorType = ErrorType
+
+---@alias WebsocketClientError { type: WebsocketClientErrorType, message: string }
+
 -- Create a new websocket client
 --
----@param opts { connect_addr: string, extra_headers?: table<string, string>, on_message: fun(message: string), on_disconnect?: fun(), on_connect?: fun() }
+---@param opts { connect_addr: string, extra_headers?: table<string, string>, on_message: fun(message: string), on_disconnect?: fun(), on_connect?: fun(), on_error?: fun(err: WebsocketClientError) }
 ---@return WebsocketClient
 function WebsocketClient.new(opts)
 	local client_id = utils.uuid()
@@ -31,6 +43,7 @@ function WebsocketClient.new(opts)
 		on_message = opts.on_message,
 		on_disconnect = opts.on_disconnect,
 		on_connect = opts.on_connect,
+		on_error = opts.on_error
 	}
 	setmetatable(obj, WebsocketClient)
 	WebsocketClientMap[client_id] = obj
@@ -70,6 +83,16 @@ function WebsocketClient:connect()
 
 			if client.on_connect then
 				client.on_connect()
+			end
+		end,
+		on_error = function(client_id, err)
+			local client = WebsocketClientMap[client_id]
+			if not client then
+				error("Encounters error but client not found", client_id)
+			end
+
+			if client.on_error then
+				client.on_error(err)
 			end
 		end,
 	}

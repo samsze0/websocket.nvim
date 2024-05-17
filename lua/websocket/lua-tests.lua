@@ -10,6 +10,9 @@ local client = WebsocketClient.new({
     end,
     on_disconnect = function()
         print("Disconnected")
+    end,
+    on_error = function(err)
+        print("On error", vim.inspect(err))
     end
 })
 
@@ -18,7 +21,7 @@ client:connect()
 -- Schedule to run in 2 seconds
 vim.defer_fn(function()
   client:send_data("Hello server")
-end, 5000)
+end, 2000)
 
 -- Schedule to run in 5 seconds
 vim.defer_fn(function()
