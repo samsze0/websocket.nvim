@@ -280,8 +280,33 @@ impl WebsocketServer {
             mut server_running_subscriber: UnboundedReceiver<bool>,
             mut outbound_broadcast_message_receiver: UnboundedReceiver<String>,
             clients: Arc<Mutex<HashMap<Uuid, Arc<Mutex<WebsocketServerClient>>>>>,
+            extra_response_headers: HashMap<String, String>,
         ) {
-            let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // https://github.com/snapview/tokio-tungstenite/blob/master/examples/server-headers.rs
+            let ws_stream = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    info!(
+                        "Received a new ws handshake from path: {} with request headers {:?}",
+                        request.uri().path(),
+                        request.headers()
+                    );
+
+                    // Expose ways to check if client connection is allowed. Something like a predicate that
+                    // returns the list of extra headers to add if the connection is allowed.
+
+                    let headers = response.headers_mut();
+                    for (key, value) in extra_response_headers {
+                        let key_static_ref: &'static str = key.leak();
+                        headers.append(key_static_ref, value.parse().unwrap());
+                    }
+
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
 
             let (client, mut running_subscriber, mut message_subscriber) =
                 WebsocketServerClient::new(
@@ -380,6 +405,7 @@ impl WebsocketServer {
             inbound_event_handler: AsyncHandle,
             mut running_subscriber: UnboundedReceiver<bool>,
             mut outbound_broadcast_message_receiver: UnboundedReceiver<String>,
+            extra_response_headers: HashMap<String, String>,
         ) {
             let listener = TcpListener::bind(format!("{host}:{port}")).await.unwrap();
             let mut server_running_publishers = vec![];
@@ -394,7 +420,7 @@ impl WebsocketServer {
                         let (client_outbound_broadcast_message_publisher, client_outbound_broadcast_message_receiver) = mpsc::unbounded_channel::<String>();
                         outbound_broadcast_message_publishers.push(client_outbound_broadcast_message_publisher.clone());
 
-                        tokio::spawn(handle_new_connection(stream, addr, inbound_event_publisher.clone(), inbound_event_handler.clone(), server_running_subscriber, client_outbound_broadcast_message_receiver, clients.clone()));
+                        tokio::spawn(handle_new_connection(stream, addr, inbound_event_publisher.clone(), inbound_event_handler.clone(), server_running_subscriber, client_outbound_broadcast_message_receiver, clients.clone(), extra_response_headers.clone()));
                     }
                     running = running_subscriber.recv() => {
                         match running {
@@ -438,6 +464,7 @@ impl WebsocketServer {
                 inbound_event_handler_clone,
                 running_subscriber,
                 outbound_broadcast_message_receiver,
+                extra_response_headers,
             )
         });
 
