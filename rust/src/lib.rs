@@ -9,6 +9,7 @@ use log4rs::{
 use nvim_oxi::{Dictionary, Object};
 
 mod client;
+mod server;
 
 #[nvim_oxi::module]
 fn websocket_ffi() -> nvim_oxi::Result<Dictionary> {
@@ -34,7 +35,10 @@ fn websocket_ffi() -> nvim_oxi::Result<Dictionary> {
 
     log_panics::init();
 
-    let api = Dictionary::from_iter([("client", Object::from(client::websocket_client_ffi()))]);
+    let api = Dictionary::from_iter([
+        ("client", Object::from(client::websocket_client_ffi())),
+        ("server", Object::from(server::websocket_server_ffi())),
+    ]);
 
     Ok(api)
 }
