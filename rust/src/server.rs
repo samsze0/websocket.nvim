@@ -26,7 +26,7 @@ lazy_static! {
 pub fn websocket_server_ffi() -> Dictionary {
     Dictionary::from_iter([
         (
-            "connect",
+            "start",
             Object::from(Function::from_fn(create_and_start_server)),
         ),
         ("terminate", Object::from(Function::from_fn(terminate))),
@@ -92,7 +92,8 @@ fn check_replay_messages(server_id: String) -> nvim_oxi::Result<Vec<String>> {
     let registry = WEBSOCKET_SERVER_REGISTRY.lock();
     let server_id = Uuid::parse_str(&server_id).unwrap();
     let server = registry.get(&server_id).unwrap();
-    Ok(server.message_replay_buffer.messages.clone())
+    let replay_buffer = server.message_replay_buffer.lock();
+    Ok(replay_buffer.messages.clone())
 }
 
 fn broadcast_data((server_id, data): (String, String)) -> nvim_oxi::Result<()> {
@@ -208,7 +209,7 @@ struct WebsocketServer {
     clients: Arc<Mutex<HashMap<Uuid, Arc<Mutex<WebsocketServerClient>>>>>,
     running: bool,
     running_publisher: UnboundedSender<bool>,
-    message_replay_buffer: OutboundMessageReplayBuffer,
+    message_replay_buffer: Arc<Mutex<OutboundMessageReplayBuffer>>,
     outbound_broadcast_message_publisher: UnboundedSender<String>,
     inbound_event_publisher: UnboundedSender<WebsocketServerInboundEvent>,
     inbound_event_handler: AsyncHandle,
@@ -281,6 +282,7 @@ impl WebsocketServer {
             mut outbound_broadcast_message_receiver: UnboundedReceiver<String>,
             clients: Arc<Mutex<HashMap<Uuid, Arc<Mutex<WebsocketServerClient>>>>>,
             extra_response_headers: HashMap<String, String>,
+            message_replay_buffer: Arc<Mutex<OutboundMessageReplayBuffer>>,
         ) {
             // https://github.com/snapview/tokio-tungstenite/blob/master/examples/server-headers.rs
             let ws_stream = tokio_tungstenite::accept_hdr_async(
@@ -315,6 +317,12 @@ impl WebsocketServer {
                     inbound_event_handler.clone(),
                 );
             let client_id = client.id;
+
+            // Replay all messages to the new client
+            for message in message_replay_buffer.lock().messages.clone() {
+                client.send_data(message);
+            }
+
             clients
                 .lock()
                 .insert(client_id, Arc::new(Mutex::new(client)));
@@ -406,6 +414,7 @@ impl WebsocketServer {
             mut running_subscriber: UnboundedReceiver<bool>,
             mut outbound_broadcast_message_receiver: UnboundedReceiver<String>,
             extra_response_headers: HashMap<String, String>,
+            message_replay_buffer: Arc<Mutex<OutboundMessageReplayBuffer>>,
         ) {
             let listener = TcpListener::bind(format!("{host}:{port}")).await.unwrap();
             let mut server_running_publishers = vec![];
@@ -420,7 +429,7 @@ impl WebsocketServer {
                         let (client_outbound_broadcast_message_publisher, client_outbound_broadcast_message_receiver) = mpsc::unbounded_channel::<String>();
                         outbound_broadcast_message_publishers.push(client_outbound_broadcast_message_publisher.clone());
 
-                        tokio::spawn(handle_new_connection(stream, addr, inbound_event_publisher.clone(), inbound_event_handler.clone(), server_running_subscriber, client_outbound_broadcast_message_receiver, clients.clone(), extra_response_headers.clone()));
+                        tokio::spawn(handle_new_connection(stream, addr, inbound_event_publisher.clone(), inbound_event_handler.clone(), server_running_subscriber, client_outbound_broadcast_message_receiver, clients.clone(), extra_response_headers.clone(), message_replay_buffer.clone()));
                     }
                     running = running_subscriber.recv() => {
                         match running {
@@ -453,6 +462,9 @@ impl WebsocketServer {
         let inbound_event_publisher_clone = inbound_event_publisher.clone();
         let inbound_event_handler_clone = inbound_event_handler.clone();
 
+        let message_replay_buffer = Arc::new(Mutex::new(OutboundMessageReplayBuffer::new()));
+        let message_replay_buffer_clone = message_replay_buffer.clone();
+
         running = true;
         running_publisher.send(true).unwrap();
         let handle = thread::spawn(move || {
@@ -465,6 +477,7 @@ impl WebsocketServer {
                 running_subscriber,
                 outbound_broadcast_message_receiver,
                 extra_response_headers,
+                message_replay_buffer_clone,
             )
         });
 
@@ -475,7 +488,7 @@ impl WebsocketServer {
             clients,
             running,
             running_publisher,
-            message_replay_buffer: OutboundMessageReplayBuffer::new(),
+            message_replay_buffer,
             outbound_broadcast_message_publisher,
             inbound_event_publisher,
             inbound_event_handler,
@@ -525,6 +538,7 @@ impl WebsocketServer {
     }
 
     fn broadcast_data(&mut self, data: String) {
+        self.message_replay_buffer.lock().add(data.clone());
         self.outbound_broadcast_message_publisher
             .send(data)
             .unwrap_or_else(|err| {
@@ -681,11 +695,5 @@ impl OutboundMessageReplayBuffer {
 
     fn add(&mut self, message: String) {
         self.messages.push(message);
-    }
-
-    fn replay(&self) {
-        for message in &self.messages {
-            print!("From Rust: {}", message);
-        }
     }
 }
