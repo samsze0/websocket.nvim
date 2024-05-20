@@ -9,13 +9,13 @@ use lazy_static::lazy_static;
 use mlua::prelude::*;
 use nvim_oxi::conversion::ToObject;
 use nvim_oxi::libuv::AsyncHandle;
-use nvim_oxi::{mlua::lua, print, schedule, Dictionary, Function, Object};
+use nvim_oxi::{mlua::lua, schedule, Dictionary, Function, Object};
 use parking_lot::Mutex;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
-use log::{self, info};
+use log::{self, error, info};
 use tokio_tungstenite::tungstenite::{self};
 
 lazy_static! {
@@ -273,137 +273,6 @@ impl WebsocketServer {
             Ok::<_, nvim_oxi::Error>(())
         })?;
 
-        async fn handle_new_connection(
-            stream: TcpStream,
-            addr: SocketAddr,
-            inbound_event_publisher: UnboundedSender<WebsocketServerInboundEvent>,
-            inbound_event_handler: AsyncHandle,
-            mut server_running_subscriber: UnboundedReceiver<bool>,
-            mut outbound_broadcast_message_receiver: UnboundedReceiver<String>,
-            clients: Arc<Mutex<HashMap<Uuid, Arc<Mutex<WebsocketServerClient>>>>>,
-            extra_response_headers: HashMap<String, String>,
-            message_replay_buffer: Arc<Mutex<OutboundMessageReplayBuffer>>,
-        ) {
-            // https://github.com/snapview/tokio-tungstenite/blob/master/examples/server-headers.rs
-            let ws_stream = tokio_tungstenite::accept_hdr_async(
-                stream,
-                |request: &tungstenite::handshake::server::Request,
-                 mut response: tungstenite::handshake::server::Response| {
-                    info!(
-                        "Received a new ws handshake from path: {} with request headers {:?}",
-                        request.uri().path(),
-                        request.headers()
-                    );
-
-                    // Expose ways to check if client connection is allowed. Something like a predicate that
-                    // returns the list of extra headers to add if the connection is allowed.
-
-                    let headers = response.headers_mut();
-                    for (key, value) in extra_response_headers {
-                        let key_static_ref: &'static str = key.leak();
-                        headers.append(key_static_ref, value.parse().unwrap());
-                    }
-
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
-
-            let (client, mut running_subscriber, mut message_subscriber) =
-                WebsocketServerClient::new(
-                    addr,
-                    inbound_event_publisher.clone(),
-                    inbound_event_handler.clone(),
-                );
-            let client_id = client.id;
-
-            // Replay all messages to the new client
-            for message in message_replay_buffer.lock().messages.clone() {
-                client.send_data(message);
-            }
-
-            clients
-                .lock()
-                .insert(client_id, Arc::new(Mutex::new(client)));
-
-            inbound_event_publisher
-                .send(WebsocketServerInboundEvent::ClientConnected(client_id))
-                .unwrap();
-            inbound_event_handler.send().unwrap();
-
-            let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-
-            loop {
-                tokio::select! {
-                    message = ws_receiver.next() => {
-                        match message {
-                            Some(message) => {
-                                let message = message.unwrap();
-                                if message.is_text() {
-                                    let data = message.into_text().expect("Message received from client is not valid string");
-                                    info!("Server-client {} received message: {}", client_id, data);
-                                    let event = WebsocketServerInboundEvent::NewMessage(client_id, data);
-                                    inbound_event_publisher.send(event).unwrap();
-                                    inbound_event_handler.send().unwrap();
-                                } else if message.is_binary() {
-                                    inbound_event_publisher
-                                        .send(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(client_id, "Binary data is not supported".to_string())))
-                                        .unwrap();
-                                    inbound_event_handler.send().unwrap();
-                                    panic!("Binary data is not supported")
-                                } else if message.is_close() {
-                                    break;
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                    running = server_running_subscriber.recv() => {
-                        match running {
-                            Some(running) => {
-                                if !running {
-                                    break;
-                                }
-                            }
-                            None => (),
-                        }
-                    }
-                    message = outbound_broadcast_message_receiver.recv() => {
-                        match message {
-                            Some(message) => {
-                                ws_sender.send(tungstenite::Message::Text(message)).await.unwrap();
-                            }
-                            None => break,
-                        }
-                    }
-                    running = running_subscriber.recv() => {
-                        match running {
-                            Some(running) => {
-                                if !running {
-                                    break;
-                                }
-                            }
-                            None => (),
-                        }
-                    }
-                    message = message_subscriber.recv() => {
-                        match message {
-                            Some(message) => {
-                                ws_sender.send(tungstenite::Message::Text(message)).await.unwrap();
-                            }
-                            None => break,
-                        }
-                    }
-                }
-            }
-
-            inbound_event_publisher
-                .send(WebsocketServerInboundEvent::ClientDisconnected(client_id))
-                .unwrap();
-            inbound_event_handler.send().unwrap();
-        }
-
         #[tokio::main]
         async fn start_websocket_server(
             host: String,
@@ -417,40 +286,41 @@ impl WebsocketServer {
             message_replay_buffer: Arc<Mutex<OutboundMessageReplayBuffer>>,
         ) {
             let listener = TcpListener::bind(format!("{host}:{port}")).await.unwrap();
-            let mut server_running_publishers = vec![];
-            let mut outbound_broadcast_message_publishers = vec![];
 
             loop {
                 tokio::select! {
                     Ok((stream, addr)) = listener.accept() => {
-                        let (server_running_publisher, server_running_subscriber) = mpsc::unbounded_channel::<bool>();
-                        server_running_publishers.push(server_running_publisher.clone());
-
-                        let (client_outbound_broadcast_message_publisher, client_outbound_broadcast_message_receiver) = mpsc::unbounded_channel::<String>();
-                        outbound_broadcast_message_publishers.push(client_outbound_broadcast_message_publisher.clone());
-
-                        tokio::spawn(handle_new_connection(stream, addr, inbound_event_publisher.clone(), inbound_event_handler.clone(), server_running_subscriber, client_outbound_broadcast_message_receiver, clients.clone(), extra_response_headers.clone(), message_replay_buffer.clone()));
+                        tokio::spawn(WebsocketServerClient::run(stream, addr, inbound_event_publisher.clone(), inbound_event_handler.clone(), extra_response_headers.clone(), message_replay_buffer.clone(), clients.clone()));
                     }
-                    running = running_subscriber.recv() => {
-                        match running {
+                    maybe_running = running_subscriber.recv() => {
+                        match maybe_running {
                             Some(running) => {
                                 if !running {
-                                    for publisher in &server_running_publishers {
-                                        publisher.send(false).unwrap();
+                                    info!("Server received termination signal. Propagating to server clients");
+                                    for client in clients.lock().values() {
+                                        let mut client = client.lock();
+                                        client.terminate();
                                     }
+                                    break;
                                 }
                             }
-                            None => (),
+                            None => {
+                                panic!("Server running subscriber channel closed unexpecetedly");
+                            }
                         }
                     }
-                    message = outbound_broadcast_message_receiver.recv() => {
-                        match message {
+                    maybe_message = outbound_broadcast_message_receiver.recv() => {
+                        match maybe_message {
                             Some(message) => {
-                                for publisher in &outbound_broadcast_message_publishers {
-                                    publisher.send(message.clone()).unwrap();
+                                info!("Server broadcasting message: {}", message);
+                                for client in clients.lock().values() {
+                                    let mut client = client.lock();
+                                    client.send_data(message.clone());
                                 }
                             }
-                            None => (),
+                            None => {
+                                panic!("Server broadcast message receiver channel closed unexpecetedly");
+                            }
                         }
                     }
                 }
@@ -564,15 +434,58 @@ struct WebsocketServerClient {
 }
 
 impl WebsocketServerClient {
-    fn new(
+    async fn run(
+        stream: TcpStream,
         addr: SocketAddr,
         inbound_event_publisher: UnboundedSender<WebsocketServerInboundEvent>,
         inbound_event_handler: AsyncHandle,
-    ) -> (Self, UnboundedReceiver<bool>, UnboundedReceiver<String>) {
+        extra_response_headers: HashMap<String, String>,
+        message_replay_buffer: Arc<Mutex<OutboundMessageReplayBuffer>>,
+        clients: Arc<Mutex<HashMap<Uuid, Arc<Mutex<WebsocketServerClient>>>>>,
+    ) -> () {
         let id = Uuid::new_v4();
-        let (running_publisher, running_subscriber) = mpsc::unbounded_channel::<bool>();
-        let (outbound_message_publisher, outbound_message_subscriber) =
+        let (running_publisher, mut running_subscriber) = mpsc::unbounded_channel::<bool>();
+        let (outbound_message_publisher, mut outbound_message_subscriber) =
             mpsc::unbounded_channel::<String>();
+
+        // https://github.com/snapview/tokio-tungstenite/blob/master/examples/server-headers.rs
+        let ws_stream = tokio_tungstenite::accept_hdr_async(
+            stream,
+            |request: &tungstenite::handshake::server::Request,
+             mut response: tungstenite::handshake::server::Response| {
+                info!(
+                    "Received a new ws handshake from path: {} with request headers {:?}",
+                    request.uri().path(),
+                    request.headers()
+                );
+
+                // Expose ways to check if client connection is allowed. Something like a predicate that
+                // returns the list of extra headers to add if the connection is allowed.
+
+                let headers = response.headers_mut();
+                for (key, value) in extra_response_headers {
+                    let key_static_ref: &'static str = key.leak();
+                    headers.append(key_static_ref, value.parse().unwrap());
+                }
+
+                Ok(response)
+            },
+        )
+        .await
+        .unwrap();
+
+        inbound_event_publisher
+            .send(WebsocketServerInboundEvent::ClientConnected(id))
+            .unwrap();
+        inbound_event_handler.send().unwrap();
+
+        // Replay all messages to the new client (append to "queue")
+        for message in message_replay_buffer.lock().messages.clone() {
+            outbound_message_publisher.send(message).unwrap();
+        }
+
+        let inbound_event_publisher_clone = inbound_event_publisher.clone();
+        let inbound_event_handler_clone = inbound_event_handler.clone();
 
         let client = Self {
             id,
@@ -580,11 +493,99 @@ impl WebsocketServerClient {
             running: true,
             running_publisher,
             outbound_message_publisher,
-            inbound_event_publisher,
-            inbound_event_handler,
+            inbound_event_publisher: inbound_event_publisher_clone,
+            inbound_event_handler: inbound_event_handler_clone,
         };
 
-        (client, running_subscriber, outbound_message_subscriber)
+        clients.lock().insert(id, Arc::new(Mutex::new(client)));
+
+        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+        loop {
+            tokio::select! {
+                maybe_item = ws_receiver.next() => {
+                    match maybe_item {
+                        Some(item) => {
+                            match item {
+                                Ok(message) => {
+                                    match message {
+                                        tungstenite::Message::Text(data) => {
+                                            info!("Server-client {} received message: {}", id, data);
+                                            let event = WebsocketServerInboundEvent::NewMessage(id, data);
+                                            inbound_event_publisher.send(event).unwrap();
+                                            inbound_event_handler.send().unwrap();
+                                        }
+                                        tungstenite::Message::Binary(data) => {
+                                            info!("Server-client {} received binary data", id);
+                                            inbound_event_publisher.send(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Binary data handling is not supported".to_string()))).unwrap();
+                                            inbound_event_handler.send().unwrap();
+                                        }
+                                        tungstenite::Message::Frame(frame) => {
+                                            info!("Server-client {} received raw frame data", id);
+                                            inbound_event_publisher.send(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Raw frame data handling is not supported".to_string()))).unwrap();
+                                            inbound_event_handler.send().unwrap();
+                                        }
+                                        tungstenite::Message::Ping(_) => {
+                                            info!("Server-client {} received ping", id);
+                                            inbound_event_publisher.send(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Ping handling is not supported".to_string()))).unwrap();
+                                            inbound_event_handler.send().unwrap();
+                                        }
+                                        tungstenite::Message::Pong(_) => {
+                                            info!("Server-client {} received pong", id);
+                                            inbound_event_publisher.send(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Pong handling is not supported".to_string()))).unwrap();
+                                            inbound_event_handler.send().unwrap();
+                                        }
+                                        tungstenite::Message::Close(_) => {
+                                            info!("Server-client {} received close", id);
+                                            break;
+                                        }
+                                    }
+                                },
+                                Err(err) => {
+                                    error!("Server-client {} received error: {}", id, err);
+                                    inbound_event_publisher
+                                        .send(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, err.to_string())))
+                                        .unwrap();
+                                    inbound_event_handler.send().unwrap();
+                                }
+                            }
+                        }
+                        None => {
+                            panic!("Server-client {} websocket receiver channel closed unexpecetedly", id);
+                        },
+                    }
+                }
+                maybe_running = running_subscriber.recv() => {
+                    match maybe_running {
+                        Some(running) => {
+                            if !running {
+                                info!("Server-client {} received termination signal", id);
+                                break;
+                            }
+                        }
+                        None => {
+                            panic!("Server-client {} running subscriber channel closed unexpecetedly", id);
+                        },
+                    }
+                }
+                maybe_message = outbound_message_subscriber.recv() => {
+                    match maybe_message {
+                        Some(message) => {
+                            info!("Server-client {} sending message: {}", id, message);
+                            ws_sender.send(tungstenite::Message::Text(message)).await.unwrap();
+                        }
+                        None => {
+                            panic!("Server-client {} message subscriber channel closed unexpecetedly", id);
+                        },
+                    }
+                }
+            }
+        }
+
+        inbound_event_publisher
+            .send(WebsocketServerInboundEvent::ClientDisconnected(id))
+            .unwrap();
+        inbound_event_handler.send().unwrap();
     }
 
     fn terminate(&mut self) {
