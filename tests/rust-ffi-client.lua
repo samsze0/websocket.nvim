@@ -1,4 +1,7 @@
-local utils = require("utils")
+local current_path = debug.getinfo(1).source:match("@?(.*/)")
+vim.opt.runtimepath:append(current_path .. "../rust")
+
+local uuid_utils = require("utils.uuid")
 
 local PORT = 12010
 local FZF_API_KEY = "test"
@@ -14,7 +17,7 @@ vim.opt.runtimepath:append(current_path .. "../../rust")
 local websocket_client_ffi = require("websocket_ffi").client
 
 print("FFI", vim.inspect(websocket_client_ffi))
-local client_id = utils.uuid()
+local client_id = uuid_utils.v4()
 _G["_WEBSOCKET_NVIM"].clients.callbacks[client_id] = {
     on_message = function(client_id, message)
         print("Callback: Received message", message)

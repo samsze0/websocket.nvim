@@ -1,5 +1,9 @@
+if _G["_WEBSOCKET_NVIM"] == nil then
+	error("Run setup() first to initialize this plugin")
+end
+
 local websocket_client_ffi = require("websocket_ffi").client
-local utils = require("utils")
+local uuid_utils = require("utils.uuid")
 
 local M = {}
 
@@ -35,7 +39,7 @@ M.ErrorType = ErrorType
 ---@param opts { connect_addr: string, extra_headers?: table<string, string>, on_message: fun(message: string), on_disconnect?: fun(), on_connect?: fun(), on_error?: fun(err: WebsocketClientError) }
 ---@return WebsocketClient
 function WebsocketClient.new(opts)
-	local client_id = utils.uuid()
+	local client_id = uuid_utils.v4()
 	local obj = {
 		client_id = client_id,
 		connect_addr = opts.connect_addr,

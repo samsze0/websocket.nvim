@@ -1,3 +1,5 @@
+require("websocket").setup({})
+
 local WebsocketClient = require("websocket.client").WebsocketClient
 
 local PORT = 12010
