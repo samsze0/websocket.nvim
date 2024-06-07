@@ -93,7 +93,7 @@ fn check_replay_messages(client_id: String) -> nvim_oxi::Result<Vec<String>> {
     Ok(client.outbound_message_replay_buffer.messages.clone())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum WebsocketClientError {
     ConnectionError(String),
     DisconnectionError(String),
@@ -101,12 +101,18 @@ enum WebsocketClientError {
     SendMessageError(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum WebsocketClientInboundEvent {
     Connected,
     Disconnected,
     NewMessage(String),
     Error(WebsocketClientError),
+}
+
+#[derive(Clone, Debug)]
+enum WebsocketClientCloseConnectionEvent {
+    Graceful,
+    Forceful,
 }
 
 // Not necessary (for now)
@@ -162,8 +168,7 @@ struct WebsocketClient {
     id: Uuid,
     connect_addr: Url,
     extra_headers: HashMap<String, String>,
-    running: bool,
-    running_publisher: UnboundedSender<bool>,
+    close_connection_event_publisher: UnboundedSender<WebsocketClientCloseConnectionEvent>,
     // Currently not used. In the future we want to support appending data to the send queue with or without connection established
     outbound_message_replay_buffer: OutboundMessageReplayBuffer,
     outbound_message_publisher: UnboundedSender<String>,
@@ -183,18 +188,18 @@ impl WebsocketClient {
 
         let callbacks = WebsocketClientCallbacks::new(id)?;
 
-        let mut running = false;
-
         let (inbound_event_publisher, mut inbound_event_receiver) =
             mpsc::unbounded_channel::<WebsocketClientInboundEvent>();
 
         let (outbound_message_publisher, outbound_message_receiver) =
             mpsc::unbounded_channel::<String>();
 
-        let (running_publisher, running_subscriber) = mpsc::unbounded_channel::<bool>();
+        let (close_connection_event_publisher, close_connection_event_subscriber) =
+            mpsc::unbounded_channel::<WebsocketClientCloseConnectionEvent>();
 
         let inbound_event_handler = AsyncHandle::new(move || {
             let event = inbound_event_receiver.blocking_recv().unwrap();
+            info!("Received event - \"{:?}\"", event);
             let callbacks_clone = callbacks.clone();
             schedule(move |_| {
                 match event {
@@ -230,7 +235,9 @@ impl WebsocketClient {
             extra_headers: HashMap<String, String>,
             inbound_event_publisher: UnboundedSender<WebsocketClientInboundEvent>,
             inbound_event_handler: AsyncHandle,
-            mut running_subscriber: UnboundedReceiver<bool>,
+            mut close_connection_event_subscriber: UnboundedReceiver<
+                WebsocketClientCloseConnectionEvent,
+            >,
             mut outbound_message_receiver: UnboundedReceiver<String>,
         ) {
             let default_port = match connect_addr.scheme() {
@@ -318,17 +325,23 @@ impl WebsocketClient {
                                     inbound_event_handler.send().unwrap();
                                     panic!("Binary data is not supported")
                                 } else if message.is_close() {
+                                    info!("Received close frame from server");
                                     break;
                                 }
                             }
-                            None => break,
+                            None => (),
                         }
                     }
-                    running = running_subscriber.recv() => {
-                        match running {
-                            Some(running) => {
-                                if !running {
-                                    break;
+                    close_event = close_connection_event_subscriber.recv() => {
+                        match close_event {
+                            Some(close_event) => {
+                                match close_event {
+                                    WebsocketClientCloseConnectionEvent::Graceful => {
+                                        ws_sender.send(tungstenite::Message::Close(None)).await.unwrap();
+                                    }
+                                    WebsocketClientCloseConnectionEvent::Forceful => {
+                                        break
+                                    }
                                 }
                             }
                             None => (),
@@ -339,11 +352,13 @@ impl WebsocketClient {
                             Some(message) => {
                                 ws_sender.send(tungstenite::Message::Text(message)).await.unwrap();
                             }
-                            None => break,
+                            None => (),
                         }
                     }
                 }
             }
+
+            info!("Closing WebSocket connection. Sending out event - \"Disconnected\"");
 
             inbound_event_publisher
                 .send(WebsocketClientInboundEvent::Disconnected)
@@ -356,15 +371,13 @@ impl WebsocketClient {
         let inbound_event_publisher_clone = inbound_event_publisher.clone();
         let inbound_event_handler_clone = inbound_event_handler.clone();
 
-        running = true;
-        running_publisher.send(true).unwrap();
         let handle = thread::spawn(move || {
             start_websocket_client(
                 connect_addr_clone,
                 extra_headers_clone,
                 inbound_event_publisher_clone,
                 inbound_event_handler_clone,
-                running_subscriber,
+                close_connection_event_subscriber,
                 outbound_message_receiver,
             )
         });
@@ -373,8 +386,7 @@ impl WebsocketClient {
             id,
             connect_addr,
             extra_headers,
-            running,
-            running_publisher,
+            close_connection_event_publisher,
             outbound_message_replay_buffer: OutboundMessageReplayBuffer::new(),
             outbound_message_publisher,
             inbound_event_publisher,
@@ -383,11 +395,10 @@ impl WebsocketClient {
     }
 
     fn disconnect(&mut self) {
-        self.running = false;
         let inbound_event_publisher = self.inbound_event_publisher.clone();
         let inbound_event_handler = self.inbound_event_handler.clone();
-        self.running_publisher
-            .send(false)
+        self.close_connection_event_publisher
+            .send(WebsocketClientCloseConnectionEvent::Graceful)
             .unwrap_or_else(move |err| {
                 inbound_event_publisher
                     .send(WebsocketClientInboundEvent::Error(
@@ -416,7 +427,7 @@ impl WebsocketClient {
     }
 
     fn is_active(&self) -> bool {
-        self.running
+        true // TODO
     }
 
     fn replay_messages(&self) {
