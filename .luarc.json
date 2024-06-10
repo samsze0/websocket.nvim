@@ -10,5 +10,11 @@
       ".test/external-dep/utils.nvim/lua"
     ],
     "checkThirdParty": false
+  },
+  "diagnostics": {
+    "groupseverity": {
+      "await": "warning",
+      "strong": "warning"
+    }
   }
 }
