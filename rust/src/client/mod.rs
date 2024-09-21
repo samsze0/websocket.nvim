@@ -3,166 +3,28 @@ use std::error::Error;
 use std::thread;
 
 use futures_util::{SinkExt, StreamExt};
-use lazy_static::lazy_static;
-use mlua::prelude::*;
-use nvim_oxi::conversion::ToObject;
+use mlua::prelude::{LuaFunction, LuaTable};
 use nvim_oxi::libuv::AsyncHandle;
-use nvim_oxi::{mlua::lua, print, schedule, Dictionary, Function, Object};
-use parking_lot::Mutex;
+use nvim_oxi::{mlua::lua, schedule};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use url::Url;
 use uuid::Uuid;
 
-use log::{self, debug, info};
+use log::{debug, info};
 use tokio_tungstenite::tungstenite::{self};
 
-lazy_static! {
-    static ref WEBSOCKET_CLIENT_REGISTRY: Mutex<WebsocketClientRegistry> =
-        Mutex::new(WebsocketClientRegistry::new());
-}
+mod ffi;
+mod inbound_event;
+mod outbound_message_replay_buffer;
+mod registry;
 
-pub fn websocket_client_ffi() -> Dictionary {
-    Dictionary::from_iter([
-        (
-            "connect",
-            Object::from(Function::from_fn(create_client_and_connect)),
-        ),
-        ("disconnect", Object::from(Function::from_fn(disconnect))),
-        ("send_data", Object::from(Function::from_fn(send_data))),
-        ("is_active", Object::from(Function::from_fn(is_active))),
-        (
-            "replay_messages",
-            Object::from(Function::from_fn(replay_messages)),
-        ),
-        (
-            "check_replay_messages",
-            Object::from(Function::from_fn(check_replay_messages)),
-        ),
-    ])
-}
+use inbound_event::{
+    WebsocketClientCloseConnectionEvent, WebsocketClientError, WebsocketClientInboundEvent,
+};
+use outbound_message_replay_buffer::OutboundMessageReplayBuffer;
+use registry::WEBSOCKET_CLIENT_REGISTRY;
 
-fn create_client_and_connect(
-    (client_id, connect_addr, extra_headers): (String, String, HashMap<String, String>),
-) -> nvim_oxi::Result<()> {
-    let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = WebsocketClient::new(client_id, connect_addr, extra_headers).unwrap();
-    registry.insert(client);
-    Ok(())
-}
-
-fn disconnect(client_id: String) -> nvim_oxi::Result<()> {
-    let client_id = Uuid::parse_str(&client_id).unwrap();
-
-    let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = registry.get_mut(&client_id).unwrap();
-    client.disconnect();
-    Ok(())
-}
-
-fn send_data((client_id, data): (String, String)) -> nvim_oxi::Result<()> {
-    let client_id = Uuid::parse_str(&client_id).unwrap();
-
-    let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = registry.get_mut(&client_id).unwrap();
-    client.send_data(data);
-    Ok(())
-}
-
-fn is_active(client_id: String) -> nvim_oxi::Result<bool> {
-    let client_id = Uuid::parse_str(&client_id).unwrap();
-
-    let registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = registry.get(&client_id).unwrap();
-    Ok(client.is_active())
-}
-
-fn replay_messages(client_id: String) -> nvim_oxi::Result<()> {
-    let client_id = Uuid::parse_str(&client_id).unwrap();
-
-    let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = registry.get_mut(&client_id).unwrap();
-    client.replay_messages();
-    Ok(())
-}
-
-fn check_replay_messages(client_id: String) -> nvim_oxi::Result<Vec<String>> {
-    let client_id = Uuid::parse_str(&client_id).unwrap();
-
-    let registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = registry.get(&client_id).unwrap();
-    Ok(client.outbound_message_replay_buffer.messages.clone())
-}
-
-#[derive(Clone, Debug)]
-enum WebsocketClientError {
-    ConnectionError(String),
-    DisconnectionError(String),
-    ReceiveMessageError(String),
-    SendMessageError(String),
-}
-
-#[derive(Clone, Debug)]
-enum WebsocketClientInboundEvent {
-    Connected,
-    Disconnected,
-    NewMessage(String),
-    Error(WebsocketClientError),
-}
-
-#[derive(Clone, Debug)]
-enum WebsocketClientCloseConnectionEvent {
-    Graceful,
-    Forceful,
-}
-
-// Not necessary (for now)
-impl ToObject for WebsocketClientError {
-    fn to_object(self) -> Result<Object, nvim_oxi::conversion::Error> {
-        match self {
-            WebsocketClientError::ConnectionError(message) => Ok(Object::from(message)),
-            WebsocketClientError::DisconnectionError(message) => Ok(Object::from(message)),
-            WebsocketClientError::ReceiveMessageError(message) => Ok(Object::from(message)),
-            WebsocketClientError::SendMessageError(message) => Ok(Object::from(message)),
-        }
-    }
-}
-
-impl<'lua> IntoLua<'lua> for WebsocketClientError {
-    fn into_lua(self, lua: &'lua Lua) -> LuaResult<LuaValue<'lua>> {
-        let vec = match self {
-            WebsocketClientError::ConnectionError(message) => {
-                vec![("type", "connection_error"), ("message", message.leak())]
-            }
-            WebsocketClientError::DisconnectionError(message) => {
-                vec![("type", "disconnection_error"), ("message", message.leak())]
-            }
-            WebsocketClientError::ReceiveMessageError(message) => {
-                vec![
-                    ("type", "receive_message_error"),
-                    ("message", message.leak()),
-                ]
-            }
-            WebsocketClientError::SendMessageError(message) => {
-                vec![("type", "send_message_error"), ("message", message.leak())]
-            }
-        };
-        Ok(LuaValue::Table(lua.create_table_from(vec)?))
-    }
-}
-
-// Unnecessary trait. Could have just wrap the received message in an enum instead
-trait TryFromStr {
-    fn try_from_string(s: String) -> Result<Self, Box<dyn Error>>
-    where
-        Self: Sized;
-}
-
-impl TryFromStr for WebsocketClientInboundEvent {
-    // Blanket implementation already exists, cannot override TryFrom trait's try_from
-    fn try_from_string(s: String) -> Result<Self, Box<dyn Error>> {
-        Ok(WebsocketClientInboundEvent::NewMessage(s))
-    }
-}
+pub use ffi::websocket_client_ffi;
 
 struct WebsocketClient {
     id: Uuid,
@@ -286,7 +148,7 @@ impl WebsocketClient {
                 );
             }
 
-            let (ws_stream, response) = tokio_tungstenite::connect_async(request)
+            let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
                 .await
                 .map_err(|err| {
                     inbound_event_publisher
@@ -371,7 +233,7 @@ impl WebsocketClient {
         let inbound_event_publisher_clone = inbound_event_publisher.clone();
         let inbound_event_handler_clone = inbound_event_handler.clone();
 
-        let handle = thread::spawn(move || {
+        let _handle = thread::spawn(move || {
             start_websocket_client(
                 connect_addr_clone,
                 extra_headers_clone,
@@ -432,60 +294,6 @@ impl WebsocketClient {
 
     fn replay_messages(&self) {
         self.outbound_message_replay_buffer.replay();
-    }
-}
-
-struct WebsocketClientRegistry {
-    // Map of client IDs to clients
-    clients: HashMap<Uuid, WebsocketClient>,
-}
-
-// https://users.rust-lang.org/t/defining-a-global-mutable-structure-to-be-used-across-several-threads/7872/3
-impl WebsocketClientRegistry {
-    fn new() -> Self {
-        Self {
-            clients: HashMap::new(),
-        }
-    }
-
-    fn insert(&mut self, client: WebsocketClient) -> () {
-        let id = client.id;
-        self.clients.insert(id, client);
-        ()
-    }
-
-    fn get(&self, id: &Uuid) -> Option<&WebsocketClient> {
-        self.clients.get(id)
-    }
-
-    fn get_mut(&mut self, id: &Uuid) -> Option<&mut WebsocketClient> {
-        self.clients.get_mut(id)
-    }
-
-    fn remove(&mut self, id: &Uuid) -> Option<WebsocketClient> {
-        self.clients.remove(id)
-    }
-}
-
-struct OutboundMessageReplayBuffer {
-    messages: Vec<String>,
-}
-
-impl OutboundMessageReplayBuffer {
-    fn new() -> Self {
-        Self {
-            messages: Vec::new(),
-        }
-    }
-
-    fn add(&mut self, message: String) {
-        self.messages.push(message);
-    }
-
-    fn replay(&self) {
-        for message in &self.messages {
-            print!("From Rust: {}", message);
-        }
     }
 }
 
