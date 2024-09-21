@@ -108,6 +108,7 @@ impl WebsocketServer {
             extra_response_headers: HashMap<String, String>,
             message_replay_buffer: Arc<Mutex<OutboundMessageReplayBuffer>>,
         ) {
+            // TODO: handle error. Port might be invalid (e.g. 1000000) / in use
             let listener = TcpListener::bind(format!("{host}:{port}")).await.unwrap();
 
             loop {
