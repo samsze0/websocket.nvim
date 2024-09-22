@@ -20,12 +20,6 @@ pub enum WebsocketClientInboundEvent {
     Error(WebsocketClientError),
 }
 
-#[derive(Clone, Debug)]
-pub enum WebsocketClientCloseConnectionEvent {
-    Graceful,
-    Forceful,
-}
-
 // Not necessary (for now)
 impl ToObject for WebsocketClientError {
     fn to_object(self) -> Result<Object, nvim_oxi::conversion::Error> {

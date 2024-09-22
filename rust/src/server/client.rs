@@ -12,16 +12,18 @@ use uuid::Uuid;
 use log::{self, error, info};
 use tokio_tungstenite::tungstenite::{self};
 
-use super::{OutboundMessageReplayBuffer, WebsocketServerError, WebsocketServerInboundEvent};
+use super::{
+    OutboundMessageReplayBuffer, WebsocketServerCloseConnectionEvent, WebsocketServerError,
+    WebsocketServerInboundEvent,
+};
 
 pub struct WebsocketServerClient {
     id: Uuid,
     addr: SocketAddr,
-    running: bool,
-    running_publisher: UnboundedSender<bool>,
     outbound_message_publisher: UnboundedSender<String>,
     inbound_event_publisher: UnboundedSender<WebsocketServerInboundEvent>,
-    inbound_event_handler: AsyncHandle,
+    lua_handle: AsyncHandle,
+    close_connection_event_publisher: UnboundedSender<WebsocketServerCloseConnectionEvent>,
 }
 
 impl WebsocketServerClient {
@@ -29,15 +31,23 @@ impl WebsocketServerClient {
         stream: TcpStream,
         addr: SocketAddr,
         inbound_event_publisher: UnboundedSender<WebsocketServerInboundEvent>,
-        inbound_event_handler: AsyncHandle,
+        lua_handle: AsyncHandle,
         extra_response_headers: HashMap<String, String>,
         message_replay_buffer: Arc<Mutex<OutboundMessageReplayBuffer>>,
         clients: Arc<Mutex<HashMap<Uuid, Arc<Mutex<WebsocketServerClient>>>>>,
     ) -> () {
         let id = Uuid::new_v4();
-        let (running_publisher, mut running_subscriber) = mpsc::unbounded_channel::<bool>();
         let (outbound_message_publisher, mut outbound_message_subscriber) =
             mpsc::unbounded_channel::<String>();
+        let (close_connection_event_publisher, mut close_connection_event_subscriber) =
+            mpsc::unbounded_channel::<WebsocketServerCloseConnectionEvent>();
+
+        let inbound_event_publisher_clone = inbound_event_publisher.clone();
+        let lua_handle_clone = lua_handle.clone();
+        let send_event = move |event: WebsocketServerInboundEvent| {
+            inbound_event_publisher_clone.send(event).unwrap();
+            lua_handle_clone.send().unwrap();
+        };
 
         // https://github.com/snapview/tokio-tungstenite/blob/master/examples/server-headers.rs
         let ws_stream = tokio_tungstenite::accept_hdr_async(
@@ -50,7 +60,7 @@ impl WebsocketServerClient {
                     request.headers()
                 );
 
-                // Expose ways to check if client connection is allowed. Something like a predicate that
+                // TODO: Expose ways to check if client connection is allowed. Something like a predicate that
                 // returns the list of extra headers to add if the connection is allowed.
 
                 let headers = response.headers_mut();
@@ -65,27 +75,20 @@ impl WebsocketServerClient {
         .await
         .unwrap();
 
-        inbound_event_publisher
-            .send(WebsocketServerInboundEvent::ClientConnected(id))
-            .unwrap();
-        inbound_event_handler.send().unwrap();
+        send_event(WebsocketServerInboundEvent::ClientConnected(id));
 
         // Replay all messages to the new client (append to "queue")
         for message in message_replay_buffer.lock().messages.clone() {
             outbound_message_publisher.send(message).unwrap();
         }
 
-        let inbound_event_publisher_clone = inbound_event_publisher.clone();
-        let inbound_event_handler_clone = inbound_event_handler.clone();
-
         let client = Self {
             id,
             addr,
-            running: true,
-            running_publisher,
             outbound_message_publisher,
-            inbound_event_publisher: inbound_event_publisher_clone,
-            inbound_event_handler: inbound_event_handler_clone,
+            inbound_event_publisher: inbound_event_publisher,
+            close_connection_event_publisher: close_connection_event_publisher,
+            lua_handle: lua_handle,
         };
 
         clients.lock().insert(id, Arc::new(Mutex::new(client)));
@@ -102,29 +105,23 @@ impl WebsocketServerClient {
                                     match message {
                                         tungstenite::Message::Text(data) => {
                                             info!("Server-client {} received message: {}", id, data);
-                                            let event = WebsocketServerInboundEvent::NewMessage(id, data);
-                                            inbound_event_publisher.send(event).unwrap();
-                                            inbound_event_handler.send().unwrap();
+                                            send_event(WebsocketServerInboundEvent::NewMessage(id, data));
                                         }
                                         tungstenite::Message::Binary(_data) => {
                                             info!("Server-client {} received binary data", id);
-                                            inbound_event_publisher.send(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Binary data handling is not supported".to_string()))).unwrap();
-                                            inbound_event_handler.send().unwrap();
+                                            send_event(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Binary data handling is not supported".to_string())));
                                         }
                                         tungstenite::Message::Frame(_frame) => {
                                             info!("Server-client {} received raw frame data", id);
-                                            inbound_event_publisher.send(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Raw frame data handling is not supported".to_string()))).unwrap();
-                                            inbound_event_handler.send().unwrap();
+                                            send_event(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Raw frame data handling is not supported".to_string())));
                                         }
                                         tungstenite::Message::Ping(_) => {
                                             info!("Server-client {} received ping", id);
-                                            inbound_event_publisher.send(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Ping handling is not supported".to_string()))).unwrap();
-                                            inbound_event_handler.send().unwrap();
+                                            send_event(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Ping handling is not supported".to_string())));
                                         }
                                         tungstenite::Message::Pong(_) => {
                                             info!("Server-client {} received pong", id);
-                                            inbound_event_publisher.send(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Pong handling is not supported".to_string()))).unwrap();
-                                            inbound_event_handler.send().unwrap();
+                                            send_event(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Pong handling is not supported".to_string())));
                                         }
                                         tungstenite::Message::Close(_) => {
                                             info!("Server-client {} received close", id);
@@ -134,10 +131,7 @@ impl WebsocketServerClient {
                                 },
                                 Err(err) => {
                                     error!("Server-client {} received error: {}", id, err);
-                                    inbound_event_publisher
-                                        .send(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, err.to_string())))
-                                        .unwrap();
-                                    inbound_event_handler.send().unwrap();
+                                    send_event(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, err.to_string())));
                                 }
                             }
                         }
@@ -146,12 +140,19 @@ impl WebsocketServerClient {
                         },
                     }
                 }
-                maybe_running = running_subscriber.recv() => {
-                    match maybe_running {
-                        Some(running) => {
-                            if !running {
-                                info!("Server-client {} received termination signal", id);
-                                break;
+                maybe_close_connection_event = close_connection_event_subscriber.recv() => {
+                    match maybe_close_connection_event {
+                        Some(close_connection_event) => {
+                            match close_connection_event {
+                                WebsocketServerCloseConnectionEvent::Graceful => {
+                                    info!("Server-client {} received termination signal", id);
+                                    ws_sender.send(tungstenite::Message::Close(None)).await.unwrap();
+                                    break;
+                                }
+                                WebsocketServerCloseConnectionEvent::Forceful => {
+                                    info!("Server-client {} received forceful termination signal", id);
+                                    break;
+                                }
                             }
                         }
                         None => {
@@ -173,23 +174,21 @@ impl WebsocketServerClient {
             }
         }
 
-        inbound_event_publisher
-            .send(WebsocketServerInboundEvent::ClientDisconnected(id))
-            .unwrap();
-        inbound_event_handler.send().unwrap();
+        send_event(WebsocketServerInboundEvent::ClientDisconnected(id));
+    }
+
+    fn send_event(&self, event: WebsocketServerInboundEvent) {
+        self.inbound_event_publisher.send(event).unwrap();
+        self.lua_handle.send().unwrap();
     }
 
     pub(super) fn terminate(&mut self) {
-        self.running = false;
-        self.running_publisher
-            .send(false)
+        self.close_connection_event_publisher
+            .send(WebsocketServerCloseConnectionEvent::Graceful)
             .unwrap_or_else(move |err| {
-                self.inbound_event_publisher
-                    .send(WebsocketServerInboundEvent::Error(
-                        WebsocketServerError::ClientTerminationError(self.id, err.to_string()),
-                    ))
-                    .unwrap();
-                self.inbound_event_handler.send().unwrap();
+                self.send_event(WebsocketServerInboundEvent::Error(
+                    WebsocketServerError::ClientTerminationError(self.id, err.to_string()),
+                ));
                 ()
             });
     }
@@ -198,17 +197,10 @@ impl WebsocketServerClient {
         self.outbound_message_publisher
             .send(data)
             .unwrap_or_else(move |err| {
-                self.inbound_event_publisher
-                    .send(WebsocketServerInboundEvent::Error(
-                        WebsocketServerError::SendMessageError(self.id, err.to_string()),
-                    ))
-                    .unwrap();
-                self.inbound_event_handler.send().unwrap();
+                self.send_event(WebsocketServerInboundEvent::Error(
+                    WebsocketServerError::SendMessageError(self.id, err.to_string()),
+                ));
                 ()
             });
-    }
-
-    pub(super) fn is_active(&self) -> bool {
-        self.running
     }
 }

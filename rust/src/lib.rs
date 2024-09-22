@@ -1,5 +1,6 @@
 use std::env;
 
+use lazy_static::lazy_static;
 use log::{self};
 use log4rs::{
     append::file::FileAppender,
@@ -7,9 +8,15 @@ use log4rs::{
     encode::pattern::PatternEncoder,
 };
 use nvim_oxi::{Dictionary, Object};
+use parking_lot::Mutex;
+use tokio::runtime::Runtime;
 
 mod client;
 mod server;
+
+lazy_static! {
+    pub static ref ASYNC_RUNTIME: Runtime = Runtime::new().expect("Failed to create async runtime");
+}
 
 #[nvim_oxi::module]
 fn websocket_ffi() -> nvim_oxi::Result<Dictionary> {
