@@ -2,6 +2,7 @@ local current_path = debug.getinfo(1).source:match("@?(.*/)")
 vim.opt.runtimepath:append(current_path .. "../rust")
 
 local uuid_utils = require("utils.uuid")
+local tbl_utils = require("utils.table")
 
 _G["_WEBSOCKET_NVIM"] = {
   clients = {
@@ -51,17 +52,13 @@ _G["_WEBSOCKET_NVIM"].servers.callbacks[server_info.id] = {
     print("Client", server_client_id, "disconnected from", server_id)
   end,
   on_client_connect = function(server_id, server_client_id)
-    print("Client", server_client_id, "connected to", server_id)
+    print("Client", server_client_id, "connected to", server_id, "Server clients:", vim.inspect(websocket_server_ffi.get_clients(server_id)))
 
     websocket_server_ffi.send_data_to_client(
       server_id,
       server_client_id,
       "Reply from server"
     )
-
-    local is_active =
-      websocket_server_ffi.is_client_active(server_id, server_client_id)
-    assert(is_active)
   end,
   on_error = function(server_id, error)
     print("Server encountered error", vim.inspect(error))
@@ -72,8 +69,13 @@ websocket_server_ffi.start(server_info.id, "localhost", server_info.port, {
   ["Extra-test-header-from-server"] = "test",
 })
 
-local is_server_active = websocket_server_ffi.is_active(server_info.id)
-T.assert(is_server_active)
+T.assert_deep_eq(websocket_server_ffi.get_servers(), {
+  [server_info.id] = {
+    id = server_info.id,
+    host = "localhost",
+    port = tostring(server_info.port),
+  },
+})
 
 local client_1_info = {
   id = uuid_utils.v4(),
@@ -140,9 +142,7 @@ websocket_client_ffi.connect(
 vim.cmd("sleep " .. 1)
 
 T.assert(client_1_info.connected)
-
-local is_client_1_active = websocket_client_ffi.is_active(client_1_info.id)
-T.assert(is_client_1_active)
+T.assert_eq(tbl_utils.len(websocket_server_ffi.get_clients(server_info.id)), 1)
 
 websocket_client_ffi.send_data(
   client_1_info.id,
@@ -165,6 +165,7 @@ websocket_client_ffi.connect(
 vim.cmd("sleep " .. 1)
 
 T.assert(client_2_info.connected)
+T.assert_eq(tbl_utils.len(websocket_server_ffi.get_clients(server_info.id)), 2)
 
 websocket_client_ffi.send_data(
   client_2_info.id,
@@ -180,14 +181,10 @@ websocket_client_ffi.disconnect(client_1_info.id)
 
 vim.cmd("sleep " .. 1)
 
-T.assert(client_1_info.disconnected)
-
-local is_client_1_active = websocket_client_ffi.is_active(client_1_info.id)
-T.assert(not is_client_1_active)
+T.assert_eq(tbl_utils.len(websocket_server_ffi.get_clients(server_info.id)), 1)
 
 websocket_server_ffi.terminate(server_info.id)
 
 vim.cmd("sleep " .. 1)
 
-local is_server_active = websocket_server_ffi.is_active(server_info.id)
-assert(not is_server_active)
+T.assert_deep_eq(websocket_server_ffi.get_servers(), {})

@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Deref};
 
 use nvim_oxi::{Dictionary, Function, Object};
 use uuid::Uuid;
 
-use super::{WebsocketServer, WEBSOCKET_SERVER_REGISTRY};
+use super::{WebsocketServer, WebsocketServerClient, WEBSOCKET_SERVER_REGISTRY};
 
 pub fn websocket_server_ffi() -> Dictionary {
     Dictionary::from_iter([
@@ -16,7 +16,6 @@ pub fn websocket_server_ffi() -> Dictionary {
             "send_data_to_client",
             Object::from(Function::from_fn(send_data_to_client)),
         ),
-        ("is_active", Object::from(Function::from_fn(is_active))),
         (
             "check_replay_messages",
             Object::from(Function::from_fn(check_replay_messages)),
@@ -30,8 +29,12 @@ pub fn websocket_server_ffi() -> Dictionary {
             Object::from(Function::from_fn(terminate_client)),
         ),
         (
-            "is_client_active",
-            Object::from(Function::from_fn(is_client_active)),
+            "get_servers",
+            Object::from(Function::from_fn(get_servers)),
+        ),
+        (
+            "get_clients",
+            Object::from(Function::from_fn(get_clients)),
         ),
     ])
 }
@@ -63,13 +66,6 @@ fn send_data_to_client(
     Ok(())
 }
 
-fn is_active(server_id: String) -> nvim_oxi::Result<bool> {
-    let registry = WEBSOCKET_SERVER_REGISTRY.lock();
-    let server_id = Uuid::parse_str(&server_id).unwrap();
-    let is_active = registry.get(&server_id).is_some();
-    Ok(is_active)
-}
-
 fn check_replay_messages(server_id: String) -> nvim_oxi::Result<Vec<String>> {
     let registry = WEBSOCKET_SERVER_REGISTRY.lock();
     let server_id = Uuid::parse_str(&server_id).unwrap();
@@ -94,9 +90,46 @@ fn terminate_client((server_id, client_id): (String, String)) -> nvim_oxi::Resul
     Ok(())
 }
 
-fn is_client_active((server_id, client_id): (String, String)) -> nvim_oxi::Result<bool> {
+fn get_servers((): ()) -> nvim_oxi::Result<Dictionary> {
+    let registry = WEBSOCKET_SERVER_REGISTRY.lock();
+    let servers: HashMap<nvim_oxi::String, Dictionary> = registry
+        .get_all()
+        .iter()
+        .map(|(id, server)| (id.to_string().as_str().into(), server.into()))
+        .collect();
+    Ok(Dictionary::from_iter(servers))
+}
+
+fn get_clients(server_id: String) -> nvim_oxi::Result<Dictionary> {
     let registry = WEBSOCKET_SERVER_REGISTRY.lock();
     let server_id = Uuid::parse_str(&server_id).unwrap();
     let server = registry.get(&server_id).unwrap();
-    Ok(server.is_client_active(client_id))
+    let clients: HashMap<nvim_oxi::String, Dictionary> = server
+        .clients
+        .lock()
+        .iter()
+        .map(|(id, client)| (id.to_string().as_str().into(), client.lock().deref().into()))
+        .collect();
+    Ok(Dictionary::from_iter(clients))
+}
+
+
+impl From<&WebsocketServer> for Dictionary {
+    fn from(server: &WebsocketServer) -> Self {
+        Dictionary::from_iter::<[(&str, &str); 3]>([
+            ("id", server.id.to_string().as_str().into()),
+            ("host", server.host.to_string().as_str().into()),
+            ("port", server.port.to_string().as_str().into())
+        ])
+    }
+}
+
+
+impl From<&WebsocketServerClient> for Dictionary {
+    fn from(client: &WebsocketServerClient) -> Self {
+        Dictionary::from_iter::<[(&str, &str); 2]>([
+            ("id", client.id.to_string().as_str().into()),
+            ("addr", client.addr.to_string().as_str().into())
+        ])
+    }
 }
