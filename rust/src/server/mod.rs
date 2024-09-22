@@ -75,9 +75,7 @@ async fn start_server(
                             }
                         }
                     }
-                    None => {
-                        panic!("Server running subscriber channel closed unexpecetedly");
-                    }
+                    None => ()
                 }
             }
             maybe_message = outbound_broadcast_message_receiver.recv() => {
@@ -89,9 +87,7 @@ async fn start_server(
                             client.send_data(message.clone());
                         }
                     }
-                    None => {
-                        panic!("Server broadcast message receiver channel closed unexpecetedly");
-                    }
+                    None => ()
                 }
             }
         }
@@ -176,6 +172,9 @@ impl WebsocketServer {
                 message_replay_buffer_clone,
             )
             .await;
+
+            info!("Server stopped");
+            WEBSOCKET_SERVER_REGISTRY.lock().remove(&id);
         });
 
         Ok(Self {
@@ -215,22 +214,12 @@ impl WebsocketServer {
         client.send_data(data);
     }
 
-    fn is_client_active(&self, client_id: String) -> bool {
-        let client_id = Uuid::parse_str(&client_id).unwrap();
-        let clients = self.clients.lock();
-        clients.get(&client_id).is_some()
-    }
-
     fn terminate_client(&mut self, client_id: String) {
         let client_id = Uuid::parse_str(&client_id).unwrap();
         let clients = self.clients.lock();
         let client = clients.get(&client_id).unwrap();
         let mut client = client.lock();
         client.terminate();
-    }
-
-    fn is_active(&self) -> bool {
-        WEBSOCKET_SERVER_REGISTRY.lock().get(&self.id).is_some()
     }
 
     fn broadcast_data(&mut self, data: String) {

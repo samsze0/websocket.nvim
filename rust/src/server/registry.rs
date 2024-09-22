@@ -41,4 +41,8 @@ impl WebsocketServerRegistry {
     pub(super) fn remove(&mut self, id: &Uuid) -> Option<WebsocketServer> {
         self.servers.remove(id)
     }
+
+    pub(super) fn get_all(&self) -> &HashMap<Uuid, WebsocketServer> {
+        &self.servers
+    }
 }

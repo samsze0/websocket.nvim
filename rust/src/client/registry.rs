@@ -41,4 +41,8 @@ impl WebsocketClientRegistry {
     pub(super) fn remove(&mut self, id: &Uuid) -> Option<WebsocketClient> {
         self.clients.remove(id)
     }
+
+    pub(super) fn get_all(&self) -> HashMap<Uuid, &WebsocketClient> {
+        self.clients.iter().map(|(id, client)| (*id, client)).collect()
+    }
 }

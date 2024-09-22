@@ -18,8 +18,8 @@ use super::{
 };
 
 pub struct WebsocketServerClient {
-    id: Uuid,
-    addr: SocketAddr,
+    pub id: Uuid,
+    pub addr: SocketAddr,
     outbound_message_publisher: UnboundedSender<String>,
     inbound_event_publisher: UnboundedSender<WebsocketServerInboundEvent>,
     lua_handle: AsyncHandle,
@@ -126,7 +126,7 @@ impl WebsocketServerClient {
                             }
                         }
                         None => {
-                            panic!("Server-client {} websocket receiver channel closed unexpecetedly", id);
+                            break;
                         },
                     }
                 }
@@ -145,9 +145,7 @@ impl WebsocketServerClient {
                                 }
                             }
                         }
-                        None => {
-                            panic!("Server-client {} running subscriber channel closed unexpecetedly", id);
-                        },
+                        None => (),
                     }
                 }
                 maybe_message = outbound_message_subscriber.recv() => {
@@ -156,13 +154,16 @@ impl WebsocketServerClient {
                             info!("Server-client {} sending message: {}", id, message);
                             ws_sender.send(tungstenite::Message::Text(message)).await.unwrap();
                         }
-                        None => {
-                            panic!("Server-client {} message subscriber channel closed unexpecetedly", id);
-                        },
+                        None => (),
                     }
                 }
             }
         }
+
+        info!("Server-client {} disconnected", id);
+        let Some(_) = clients.lock().remove(&id) else {
+            panic!("Server-client {} not found in registry", id);
+        };
 
         send_event(WebsocketServerInboundEvent::ClientDisconnected(id));
     }
