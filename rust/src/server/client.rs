@@ -115,18 +115,8 @@ impl WebsocketServerClient {
                                             info!("Server-client {} received raw frame data", id);
                                             send_event(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Raw frame data handling is not supported".to_string())));
                                         }
-                                        tungstenite::Message::Ping(_) => {
-                                            info!("Server-client {} received ping", id);
-                                            send_event(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Ping handling is not supported".to_string())));
-                                        }
-                                        tungstenite::Message::Pong(_) => {
-                                            info!("Server-client {} received pong", id);
-                                            send_event(WebsocketServerInboundEvent::Error(WebsocketServerError::ReceiveMessageError(id, "Pong handling is not supported".to_string())));
-                                        }
-                                        tungstenite::Message::Close(_) => {
-                                            info!("Server-client {} received close", id);
-                                            break;
-                                        }
+                                        // Ping, pong, close are handled by tokio-tungstenite
+                                        _ => {}
                                     }
                                 },
                                 Err(err) => {
