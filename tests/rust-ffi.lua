@@ -72,8 +72,8 @@ websocket_server_ffi.start(server_info.id, "localhost", server_info.port, {
   ["Extra-test-header-from-server"] = "test",
 })
 
-local is_active = websocket_server_ffi.is_active(server_info.id)
-T.assert(is_active)
+local is_server_active = websocket_server_ffi.is_active(server_info.id)
+T.assert(is_server_active)
 
 local client_1_info = {
   id = uuid_utils.v4(),
@@ -141,8 +141,8 @@ vim.cmd("sleep " .. 1)
 
 T.assert(client_1_info.connected)
 
-local is_active = websocket_client_ffi.is_active(client_1_info.id)
-T.assert(is_active)
+local is_client_1_active = websocket_client_ffi.is_active(client_1_info.id)
+T.assert(is_client_1_active)
 
 websocket_client_ffi.send_data(
   client_1_info.id,
@@ -154,11 +154,40 @@ vim.cmd("sleep " .. 1)
 T.assert_eq(client_1_info.last_message, "Reply from server")
 T.assert_not(client_1_info.last_error)
 
+websocket_client_ffi.connect(
+  client_2_info.id,
+  ("ws://localhost:%d"):format(server_info.port),
+  {
+    ["Extra-test-header"] = "test",
+  }
+)
+
+vim.cmd("sleep " .. 1)
+
+T.assert(client_2_info.connected)
+
+websocket_client_ffi.send_data(
+  client_2_info.id,
+  "Hi from client 2"
+)
+
+vim.cmd("sleep " .. 1)
+
+T.assert_eq(client_2_info.last_message, "Reply from server")
+T.assert_not(client_2_info.last_error)
+
 websocket_client_ffi.disconnect(client_1_info.id)
 
 vim.cmd("sleep " .. 1)
 
 T.assert(client_1_info.disconnected)
 
-local is_active = websocket_client_ffi.is_active(client_1_info.id)
-T.assert(not is_active)
+local is_client_1_active = websocket_client_ffi.is_active(client_1_info.id)
+T.assert(not is_client_1_active)
+
+websocket_server_ffi.terminate(server_info.id)
+
+vim.cmd("sleep " .. 1)
+
+local is_server_active = websocket_server_ffi.is_active(server_info.id)
+assert(not is_server_active)
