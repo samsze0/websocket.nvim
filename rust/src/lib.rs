@@ -25,7 +25,7 @@ fn websocket_ffi() -> nvim_oxi::Result<Dictionary> {
     let file_appender = FileAppender::builder()
         // Pattern: https://docs.rs/log4rs/*/log4rs/encode/pattern/index.html
         .encoder(Box::new(PatternEncoder::new(
-            "[{l}] {d(%Y-%m-%d %H:%M:%S)} {m}\n",
+            "[{l}] {d(%Y-%m-%d %H:%M:%S)} {f}:{L} - {m}\n",
         )))
         .build("/tmp/websocket-nvim.log")
         .expect("Failed to create file appender");
