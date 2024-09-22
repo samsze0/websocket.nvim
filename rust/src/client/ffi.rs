@@ -14,15 +14,7 @@ pub fn websocket_client_ffi() -> Dictionary {
         ),
         ("disconnect", Object::from(Function::from_fn(disconnect))),
         ("send_data", Object::from(Function::from_fn(send_data))),
-        ("is_active", Object::from(Function::from_fn(is_active))),
-        (
-            "replay_messages",
-            Object::from(Function::from_fn(replay_messages)),
-        ),
-        (
-            "check_replay_messages",
-            Object::from(Function::from_fn(check_replay_messages)),
-        ),
+        ("is_active", Object::from(Function::from_fn(is_active)))
     ])
 }
 
@@ -57,23 +49,6 @@ fn is_active(client_id: String) -> nvim_oxi::Result<bool> {
     let client_id = Uuid::parse_str(&client_id).unwrap();
 
     let registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = registry.get(&client_id).unwrap();
-    Ok(client.is_active())
-}
-
-fn replay_messages(client_id: String) -> nvim_oxi::Result<()> {
-    let client_id = Uuid::parse_str(&client_id).unwrap();
-
-    let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = registry.get_mut(&client_id).unwrap();
-    client.replay_messages();
-    Ok(())
-}
-
-fn check_replay_messages(client_id: String) -> nvim_oxi::Result<Vec<String>> {
-    let client_id = Uuid::parse_str(&client_id).unwrap();
-
-    let registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = registry.get(&client_id).unwrap();
-    Ok(client.outbound_message_replay_buffer.messages.clone())
+    let is_active = registry.get(&client_id).is_some();
+    Ok(is_active)
 }

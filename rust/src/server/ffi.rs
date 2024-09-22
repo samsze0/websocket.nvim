@@ -66,8 +66,8 @@ fn send_data_to_client(
 fn is_active(server_id: String) -> nvim_oxi::Result<bool> {
     let registry = WEBSOCKET_SERVER_REGISTRY.lock();
     let server_id = Uuid::parse_str(&server_id).unwrap();
-    let server = registry.get(&server_id).unwrap();
-    Ok(server.is_active())
+    let is_active = registry.get(&server_id).is_some();
+    Ok(is_active)
 }
 
 fn check_replay_messages(server_id: String) -> nvim_oxi::Result<Vec<String>> {

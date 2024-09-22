@@ -32,7 +32,9 @@ impl ToObject for WebsocketServerError {
             WebsocketServerError::ReceiveMessageError(_client_id, message) => {
                 Ok(Object::from(message))
             }
-            WebsocketServerError::SendMessageError(_client_id, message) => Ok(Object::from(message)),
+            WebsocketServerError::SendMessageError(_client_id, message) => {
+                Ok(Object::from(message))
+            }
             WebsocketServerError::BroadcastMessageError(message) => Ok(Object::from(message)),
             WebsocketServerError::ServerTerminationError(message) => Ok(Object::from(message)),
         }

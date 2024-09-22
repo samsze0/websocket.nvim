@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
-use std::thread;
 
 use mlua::prelude::{LuaFunction, LuaTable};
 use nvim_oxi::libuv::AsyncHandle;
@@ -19,23 +18,84 @@ mod inbound_event;
 mod outbound_message_replay_buffer;
 mod registry;
 
+pub use super::ASYNC_RUNTIME;
 pub use client::WebsocketServerClient;
 pub use ffi::websocket_server_ffi;
 pub use inbound_event::{WebsocketServerError, WebsocketServerInboundEvent};
 pub use outbound_message_replay_buffer::OutboundMessageReplayBuffer;
 pub use registry::WEBSOCKET_SERVER_REGISTRY;
 
+type WebsocketServerClients = Arc<Mutex<HashMap<Uuid, Arc<Mutex<WebsocketServerClient>>>>>;
+
 struct WebsocketServer {
     id: Uuid,
     host: String,
     port: u32,
-    clients: Arc<Mutex<HashMap<Uuid, Arc<Mutex<WebsocketServerClient>>>>>,
-    running: bool,
-    running_publisher: UnboundedSender<bool>,
+    clients: WebsocketServerClients,
+    close_connection_event_publisher: UnboundedSender<WebsocketServerCloseConnectionEvent>,
     message_replay_buffer: Arc<Mutex<OutboundMessageReplayBuffer>>,
     outbound_broadcast_message_publisher: UnboundedSender<String>,
     inbound_event_publisher: UnboundedSender<WebsocketServerInboundEvent>,
-    inbound_event_handler: AsyncHandle,
+    lua_handle: AsyncHandle,
+}
+
+async fn start_server(
+    host: String,
+    port: u32,
+    clients: WebsocketServerClients,
+    inbound_event_publisher: UnboundedSender<WebsocketServerInboundEvent>,
+    lua_handle: AsyncHandle,
+    mut close_connection_event_subscriber: UnboundedReceiver<WebsocketServerCloseConnectionEvent>,
+    mut outbound_broadcast_message_receiver: UnboundedReceiver<String>,
+    extra_response_headers: HashMap<String, String>,
+    message_replay_buffer: Arc<Mutex<OutboundMessageReplayBuffer>>,
+) {
+    // TODO: handle error. Port might be invalid (e.g. 1000000) / in use
+    let listener = TcpListener::bind(format!("{host}:{port}")).await.unwrap();
+
+    loop {
+        tokio::select! {
+            Ok((stream, addr)) = listener.accept() => {
+                tokio::spawn(WebsocketServerClient::run(stream, addr, inbound_event_publisher.clone(), lua_handle.clone(), extra_response_headers.clone(), message_replay_buffer.clone(), clients.clone()));
+            }
+            maybe_close_connection_event = close_connection_event_subscriber.recv() => {
+                match maybe_close_connection_event {
+                    Some(close_connection_event) => {
+                        match close_connection_event {
+                            WebsocketServerCloseConnectionEvent::Graceful => {
+                                info!("Server received termination signal. Propagating to server clients");
+                                for client in clients.lock().values() {
+                                    let mut client = client.lock();
+                                    client.terminate();
+                                }
+                                break;
+                            }
+                            WebsocketServerCloseConnectionEvent::Forceful => {
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        panic!("Server running subscriber channel closed unexpecetedly");
+                    }
+                }
+            }
+            maybe_message = outbound_broadcast_message_receiver.recv() => {
+                match maybe_message {
+                    Some(message) => {
+                        info!("Server broadcasting message: {}", message);
+                        for client in clients.lock().values() {
+                            let client = client.lock();
+                            client.send_data(message.clone());
+                        }
+                    }
+                    None => {
+                        panic!("Server broadcast message receiver channel closed unexpecetedly");
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl WebsocketServer {
@@ -49,19 +109,18 @@ impl WebsocketServer {
 
         let callbacks = WebsocketServerCallbacks::new(id)?;
 
-        let mut running = false;
-
         let (inbound_event_publisher, mut inbound_event_receiver) =
             mpsc::unbounded_channel::<WebsocketServerInboundEvent>();
 
         let (outbound_broadcast_message_publisher, outbound_broadcast_message_receiver) =
             mpsc::unbounded_channel::<String>();
 
-        let (running_publisher, running_subscriber) = mpsc::unbounded_channel::<bool>();
+        let (close_connection_event_publisher, close_connection_event_subscriber) =
+            mpsc::unbounded_channel::<WebsocketServerCloseConnectionEvent>();
 
         let clients = Arc::new(Mutex::new(HashMap::new()));
 
-        let inbound_event_handler = AsyncHandle::new(move || {
+        let lua_handle = AsyncHandle::new(move || {
             let event = inbound_event_receiver.blocking_recv().unwrap();
             let callbacks_clone = callbacks.clone();
             schedule(move |_| {
@@ -96,83 +155,27 @@ impl WebsocketServer {
             Ok::<_, nvim_oxi::Error>(())
         })?;
 
-        #[tokio::main]
-        async fn start_websocket_server(
-            host: String,
-            port: u32,
-            clients: Arc<Mutex<HashMap<Uuid, Arc<Mutex<WebsocketServerClient>>>>>,
-            inbound_event_publisher: UnboundedSender<WebsocketServerInboundEvent>,
-            inbound_event_handler: AsyncHandle,
-            mut running_subscriber: UnboundedReceiver<bool>,
-            mut outbound_broadcast_message_receiver: UnboundedReceiver<String>,
-            extra_response_headers: HashMap<String, String>,
-            message_replay_buffer: Arc<Mutex<OutboundMessageReplayBuffer>>,
-        ) {
-            // TODO: handle error. Port might be invalid (e.g. 1000000) / in use
-            let listener = TcpListener::bind(format!("{host}:{port}")).await.unwrap();
-
-            loop {
-                tokio::select! {
-                    Ok((stream, addr)) = listener.accept() => {
-                        tokio::spawn(WebsocketServerClient::run(stream, addr, inbound_event_publisher.clone(), inbound_event_handler.clone(), extra_response_headers.clone(), message_replay_buffer.clone(), clients.clone()));
-                    }
-                    maybe_running = running_subscriber.recv() => {
-                        match maybe_running {
-                            Some(running) => {
-                                if !running {
-                                    info!("Server received termination signal. Propagating to server clients");
-                                    for client in clients.lock().values() {
-                                        let mut client = client.lock();
-                                        client.terminate();
-                                    }
-                                    break;
-                                }
-                            }
-                            None => {
-                                panic!("Server running subscriber channel closed unexpecetedly");
-                            }
-                        }
-                    }
-                    maybe_message = outbound_broadcast_message_receiver.recv() => {
-                        match maybe_message {
-                            Some(message) => {
-                                info!("Server broadcasting message: {}", message);
-                                for client in clients.lock().values() {
-                                    let client = client.lock();
-                                    client.send_data(message.clone());
-                                }
-                            }
-                            None => {
-                                panic!("Server broadcast message receiver channel closed unexpecetedly");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         let host_clone = host.clone();
         let clients_clone = clients.clone();
         let inbound_event_publisher_clone = inbound_event_publisher.clone();
-        let inbound_event_handler_clone = inbound_event_handler.clone();
+        let inbound_event_handler_clone = lua_handle.clone();
 
         let message_replay_buffer = Arc::new(Mutex::new(OutboundMessageReplayBuffer::new()));
         let message_replay_buffer_clone = message_replay_buffer.clone();
 
-        running = true;
-        running_publisher.send(true).unwrap();
-        let _handle = thread::spawn(move || {
-            start_websocket_server(
+        let _handle = ASYNC_RUNTIME.spawn(async move {
+            start_server(
                 host_clone,
                 port,
                 clients_clone,
                 inbound_event_publisher_clone,
                 inbound_event_handler_clone,
-                running_subscriber,
+                close_connection_event_subscriber,
                 outbound_broadcast_message_receiver,
                 extra_response_headers,
                 message_replay_buffer_clone,
             )
+            .await;
         });
 
         Ok(Self {
@@ -180,25 +183,26 @@ impl WebsocketServer {
             host,
             port,
             clients,
-            running,
-            running_publisher,
+            close_connection_event_publisher,
             message_replay_buffer,
             outbound_broadcast_message_publisher,
             inbound_event_publisher,
-            inbound_event_handler,
+            lua_handle,
         })
     }
 
+    fn send_event(&self, event: WebsocketServerInboundEvent) {
+        self.inbound_event_publisher.send(event).unwrap();
+        self.lua_handle.send().unwrap();
+    }
+
     fn terminate(&self) {
-        self.running_publisher
-            .send(false)
+        self.close_connection_event_publisher
+            .send(WebsocketServerCloseConnectionEvent::Graceful)
             .unwrap_or_else(move |err| {
-                self.inbound_event_publisher
-                    .send(WebsocketServerInboundEvent::Error(
-                        WebsocketServerError::ServerTerminationError(err.to_string()),
-                    ))
-                    .unwrap();
-                self.inbound_event_handler.send().unwrap();
+                self.send_event(WebsocketServerInboundEvent::Error(
+                    WebsocketServerError::ServerTerminationError(err.to_string()),
+                ));
                 ()
             });
     }
@@ -214,9 +218,7 @@ impl WebsocketServer {
     fn is_client_active(&self, client_id: String) -> bool {
         let client_id = Uuid::parse_str(&client_id).unwrap();
         let clients = self.clients.lock();
-        let client = clients.get(&client_id).unwrap();
-        let client = client.lock();
-        client.is_active()
+        clients.get(&client_id).is_some()
     }
 
     fn terminate_client(&mut self, client_id: String) {
@@ -228,7 +230,7 @@ impl WebsocketServer {
     }
 
     fn is_active(&self) -> bool {
-        self.running
+        WEBSOCKET_SERVER_REGISTRY.lock().get(&self.id).is_some()
     }
 
     fn broadcast_data(&mut self, data: String) {
@@ -236,12 +238,9 @@ impl WebsocketServer {
         self.outbound_broadcast_message_publisher
             .send(data)
             .unwrap_or_else(|err| {
-                self.inbound_event_publisher
-                    .send(WebsocketServerInboundEvent::Error(
-                        WebsocketServerError::BroadcastMessageError(err.to_string()),
-                    ))
-                    .unwrap();
-                self.inbound_event_handler.send().unwrap();
+                self.send_event(WebsocketServerInboundEvent::Error(
+                    WebsocketServerError::BroadcastMessageError(err.to_string()),
+                ));
                 ()
             });
     }
@@ -256,15 +255,14 @@ struct WebsocketServerCallbacks<'a> {
 }
 
 impl<'a> WebsocketServerCallbacks<'a> {
-    // TODO: possible performance impact by using lua() here?
-    fn new(client_id: Uuid) -> Result<Self, Box<dyn Error>> {
+    fn new(server_id: Uuid) -> Result<Self, Box<dyn Error>> {
         let lua = lua();
         let callbacks = lua
             .globals()
             .get::<_, LuaTable>("_WEBSOCKET_NVIM")?
             .get::<_, LuaTable>("servers")?
             .get::<_, LuaTable>("callbacks")?
-            .get::<_, LuaTable>(client_id.to_string())?;
+            .get::<_, LuaTable>(server_id.to_string())?;
 
         Ok(Self {
             on_message: callbacks.get::<_, Option<LuaFunction>>("on_message")?,
@@ -274,4 +272,10 @@ impl<'a> WebsocketServerCallbacks<'a> {
             on_error: callbacks.get::<_, Option<LuaFunction>>("on_error")?,
         })
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum WebsocketServerCloseConnectionEvent {
+    Graceful,
+    Forceful,
 }
