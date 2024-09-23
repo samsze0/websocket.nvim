@@ -1,9 +1,5 @@
 # websocket.nvim
 
-WIP
-
-Websocket implementation for Neovim
-
 ## Installation
 
 [lazy.nvim](https://github.com/folke/lazy.nvim)
@@ -17,33 +13,59 @@ Websocket implementation for Neovim
 }
 ```
 
+Client:
 ```lua
 local WebsocketClient = require("websocket.client").WebsocketClient
 
 local client = WebsocketClient.new({
     connect_addr = "ws://localhost:8080",
-    on_message = function(message)
+    on_message = function(self, message)
         print("Received message: " .. message)
     end,
-    on_connect = function()
+    on_connect = function(self)
         print("Connected")
     end,
-    on_disconnect = function()
+    on_disconnect = function(self)
         print("Disconnected")
     end
 })
 
-client:connect()
+client:try_connect()
 
 -- Schedule to run in 2 seconds
 vim.defer_fn(function()
-  client:send("Hello server")
-end, 5000)
+  client:try_send_data("Hello server")
+end, 2000)
 
 -- Schedule to run in 5 seconds
 vim.defer_fn(function()
-  client:disconnect()
+  client:try_disconnect()
 end, 5000)
+```
+
+Server:
+```lua
+local WebsocketServer = require("websocket.server").WebsocketServer
+
+local server = WebsocketServer.new({
+    host = "localhost",
+    port = 12001,
+    on_message = function(self, client_id, message)
+        print("Server received message from client " .. client_id .. ": " .. message)
+        self:try_send_data_to_client(client_id, "Reply from server")
+    end,
+    on_client_connect = function(self, client_id)
+        print("Client " .. client_id .. " connected")
+    end,
+    on_client_disconnect = function(self, client_id)
+        print("Client " .. client_id .. " disconnected")
+    end,
+    on_error = function(self, err)
+        print("Server encountered error", vim.inspect(err))
+    end,
+})
+
+server:try_start()
 ```
 
 ## How it works

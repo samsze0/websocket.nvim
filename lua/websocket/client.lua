@@ -11,10 +11,10 @@ local M = {}
 ---@field client_id string
 ---@field connect_addr string
 ---@field extra_headers table<string, string>
----@field on_message fun(message: string)
----@field on_disconnect fun()
----@field on_connect fun()
----@field on_error fun(err: WebsocketClientError)
+---@field on_message fun(self: WebsocketClient, message: string)
+---@field on_disconnect fun(self: WebsocketClient)
+---@field on_connect fun(self: WebsocketClient)
+---@field on_error fun(self: WebsocketClient, err: WebsocketClientError)
 local WebsocketClient = {}
 WebsocketClient.__index = WebsocketClient
 WebsocketClient.__is_class = true
@@ -36,7 +36,7 @@ M.ErrorType = ErrorType
 
 -- Create a new websocket client
 --
----@param opts { connect_addr: string, extra_headers?: table<string, string>, on_message: fun(message: string), on_disconnect?: fun(), on_connect?: fun(), on_error?: fun(err: WebsocketClientError) }
+---@param opts { connect_addr: string, extra_headers?: table<string, string>, on_message: fun(self: WebsocketClient, message: string), on_disconnect?: fun(self: WebsocketClient), on_connect?: fun(self: WebsocketClient), on_error?: fun(self: WebsocketClient, err: WebsocketClientError) }
 ---@return WebsocketClient
 function WebsocketClient.new(opts)
   local client_id = uuid_utils.v4()
@@ -63,7 +63,7 @@ function WebsocketClient:try_connect()
         error("Received message but client not found", client_id)
       end
 
-      if client.on_message then client.on_message(message) end
+      if client.on_message then client.on_message(client, message) end
     end,
     on_disconnect = function(client_id)
       local client = WebsocketClientMap[client_id]
@@ -73,13 +73,13 @@ function WebsocketClient:try_connect()
 
       WebsocketClientMap[client_id] = nil
 
-      if client.on_disconnect then client.on_disconnect() end
+      if client.on_disconnect then client.on_disconnect(client) end
     end,
     on_connect = function(client_id)
       local client = WebsocketClientMap[client_id]
       if not client then error("Connected but client not found", client_id) end
 
-      if client.on_connect then client.on_connect() end
+      if client.on_connect then client.on_connect(client) end
     end,
     on_error = function(client_id, err)
       local client = WebsocketClientMap[client_id]
@@ -87,7 +87,7 @@ function WebsocketClient:try_connect()
         error("Encounters error but client not found", client_id)
       end
 
-      if client.on_error then client.on_error(err) end
+      if client.on_error then client.on_error(client, err) end
     end,
   }
   websocket_client_ffi.connect(

@@ -19,19 +19,19 @@ local client_2_info = {
 
 local client_1 = WebsocketClient.new({
   connect_addr = ("ws://localhost:%d"):format(PORT),
-  on_message = function(message)
+  on_message = function(self, message)
     print("Client 1 received message: " .. message)
     client_1_info.last_message = message
   end,
-  on_connect = function()
+  on_connect = function(self)
     print("Client 1 connected")
     client_1_info.connected = true
   end,
-  on_disconnect = function()
+  on_disconnect = function(self)
     print("Client 1 disconnected")
     client_1_info.connected = false
   end,
-  on_error = function(err)
+  on_error = function(self, err)
     print("Client 1 encountered error", vim.inspect(err))
     client_1_info.last_error = err
   end,
@@ -42,19 +42,19 @@ local client_1 = WebsocketClient.new({
 
 local client_2 = WebsocketClient.new({
   connect_addr = ("ws://localhost:%d"):format(PORT),
-  on_message = function(message)
+  on_message = function(self, message)
     print("Client 2 received message: " .. message)
     client_2_info.last_message = message
   end,
-  on_connect = function()
+  on_connect = function(self)
     print("Client 2 connected")
     client_2_info.connected = true
   end,
-  on_disconnect = function()
+  on_disconnect = function(self)
     print("Client 2 disconnected")
     client_2_info.connected = false
   end,
-  on_error = function(err)
+  on_error = function(self, err)
     print("Client 2 encountered error", vim.inspect(err))
     client_2_info.last_error = err
   end,
