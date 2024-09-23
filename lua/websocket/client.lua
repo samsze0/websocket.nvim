@@ -55,7 +55,7 @@ function WebsocketClient.new(opts)
 end
 
 -- Connect to the websocket server
-function WebsocketClient:connect()
+function WebsocketClient:try_connect()
   _G["_WEBSOCKET_NVIM"].clients.callbacks[self.client_id] = {
     on_message = function(client_id, message)
       local client = WebsocketClientMap[client_id]
@@ -63,7 +63,7 @@ function WebsocketClient:connect()
         error("Received message but client not found", client_id)
       end
 
-      client.on_message(message)
+      if client.on_message then client.on_message(message) end
     end,
     on_disconnect = function(client_id)
       local client = WebsocketClientMap[client_id]
@@ -101,18 +101,26 @@ end
 --
 ---@return boolean
 function WebsocketClient:is_active()
-  return websocket_client_ffi.is_active(self.client_id)
+  return WebsocketClient.get_clients()[self.client_id] ~= nil
+end
+
+-- Get all active websocket clients
+--
+---@return table<string, { id: string, connect_addr: string }>
+function WebsocketClient.get_clients()
+  local clients = websocket_client_ffi.get_clients()
+  return clients
 end
 
 -- Send data to the websocket server
 --
 ---@param data string
-function WebsocketClient:send_data(data)
+function WebsocketClient:try_send_data(data)
   websocket_client_ffi.send_data(self.client_id, data)
 end
 
 -- Disconnect from the websocket server
-function WebsocketClient:disconnect()
+function WebsocketClient:try_disconnect()
   websocket_client_ffi.disconnect(self.client_id)
 end
 

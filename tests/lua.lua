@@ -1,29 +1,118 @@
--- require("websocket").setup({})
+require("websocket").setup({})
 
--- local WebsocketClient = require("websocket.client").WebsocketClient
+local WebsocketClient = require("websocket.client").WebsocketClient
+local WebsocketServer = require("websocket.server").WebsocketServer
 
--- local PORT = 12010
--- local FZF_API_KEY = "test"
+local PORT = 12001
 
--- local client = WebsocketClient.new({
---   connect_addr = ("ws://localhost:%d"):format(PORT),
---   on_message = function(message) print("Received message: " .. message) end,
---   on_connect = function() print("Connected") end,
---   on_disconnect = function() print("Disconnected") end,
---   on_error = function(err) print("On error", vim.inspect(err)) end,
---   extra_headers = {
---     ["Fzf-Api-Key"] = FZF_API_KEY,
---   },
--- })
+local client_1_info = {
+    connected = false,
+    last_message = nil,
+    last_error = nil
+}
 
--- client:connect()
+local client_2_info = {
+    connected = false,
+    last_message = nil,
+    last_error = nil
+}
 
--- -- Schedule to run in 2 seconds
--- vim.defer_fn(
---   function() client:send_data("pos(3)+websocket-broadcast@Hi from server@") end,
---   2000
--- )
+local client_1 = WebsocketClient.new({
+  connect_addr = ("ws://localhost:%d"):format(PORT),
+  on_message = function(message)
+    print("Client 1 received message: " .. message)
+    client_1_info.last_message = message
+  end,
+  on_connect = function()
+    print("Client 1 connected")
+    client_1_info.connected = true
+  end,
+  on_disconnect = function()
+    print("Client 1 disconnected")
+    client_1_info.connected = false
+  end,
+  on_error = function(err)
+    print("Client 1 encountered error", vim.inspect(err))
+    client_1_info.last_error = err
+  end,
+  extra_headers = {
+    ["Extra-test-header"] = "test-value",
+  },
+})
 
--- -- Schedule to run in 5 seconds
--- vim.defer_fn(function() client:disconnect() end, 5000)
+local client_2 = WebsocketClient.new({
+  connect_addr = ("ws://localhost:%d"):format(PORT),
+  on_message = function(message)
+    print("Client 2 received message: " .. message)
+    client_2_info.last_message = message
+  end,
+  on_connect = function()
+    print("Client 2 connected")
+    client_2_info.connected = true
+  end,
+  on_disconnect = function()
+    print("Client 2 disconnected")
+    client_2_info.connected = false
+  end,
+  on_error = function(err)
+    print("Client 2 encountered error", vim.inspect(err))
+    client_2_info.last_error = err
+  end,
+  extra_headers = {
+    ["Extra-test-header"] = "test-value",
+  },
+})
 
+T.assert(not client_1:is_active())
+T.assert(not client_2:is_active())
+T.assert_deep_eq(WebsocketClient.get_clients(), {})
+
+local server_info = {
+    host = "localhost",
+    port = PORT
+}
+
+local server = WebsocketServer.new({
+    host = server_info.host,
+    port = server_info.port,
+    extra_response_headers = {
+        ["Extra-test-header"] = "test-value",
+    },
+    on_message = function(self, client_id, message)
+        print("Server received message from client " .. client_id .. ": " .. message)
+        self:try_send_data_to_client(client_id, "Reply from server")
+    end,
+    on_client_connect = function(self, client_id)
+        print("Client " .. client_id .. " connected")
+    end,
+    on_client_disconnect = function(self, client_id)
+        print("Client " .. client_id .. " disconnected")
+    end,
+    on_error = function(self, err)
+        print("Server encountered error", vim.inspect(err))
+    end,
+})
+
+T.assert_deep_eq(WebsocketServer.get_servers(), {})
+
+server:try_start()
+
+vim.cmd("sleep 1")
+
+T.assert(server:is_active())
+
+client_1:try_connect()
+client_2:try_connect()
+
+vim.cmd("sleep 1")
+
+T.assert(client_1:is_active())
+T.assert(client_2:is_active())
+
+client_1:try_send_data("Hi from client 1")
+client_2:try_send_data("Hi from client 2")
+
+vim.cmd("sleep 1")
+
+T.assert_eq(client_1_info.last_message, "Reply from server")
+T.assert_eq(client_2_info.last_message, "Reply from server")
