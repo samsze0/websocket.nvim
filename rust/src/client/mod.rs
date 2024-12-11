@@ -4,8 +4,6 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt, TryFutureExt};
 use mlua::prelude::{LuaFunction, LuaTable};
-use nvim_oxi::libuv::AsyncHandle;
-use nvim_oxi::{mlua::lua, schedule};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -38,14 +36,14 @@ struct WebsocketClient {
     outbound_message_receiver: Option<UnboundedReceiver<String>>,
     inbound_event_publisher: UnboundedSender<WebsocketClientInboundEvent>,
 
-    lua_handle: AsyncHandle,
+    lua_handle: nvim_oxi::libuv::AsyncHandle,
     task_handle: Option<JoinHandle<()>>,
 }
 
 async fn start_loop(
     ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     inbound_event_publisher: &UnboundedSender<WebsocketClientInboundEvent>,
-    lua_handle: &AsyncHandle,
+    lua_handle: &nvim_oxi::libuv::AsyncHandle,
     mut close_connection_event_subscriber: UnboundedReceiver<WebsocketClientCloseConnectionEvent>,
     mut outbound_message_receiver: UnboundedReceiver<String>,
 ) {
@@ -147,11 +145,11 @@ impl WebsocketClient {
             mpsc::unbounded_channel::<WebsocketClientCloseConnectionEvent>();
 
         // TODO: destroy this handle when the client is destroyed
-        let lua_handle = AsyncHandle::new(move || {
+        let lua_handle = nvim_oxi::libuv::AsyncHandle::new(move || {
             let event = inbound_event_receiver.blocking_recv().unwrap();
             info!("Received event - \"{:?}\"", event);
             let callbacks = callbacks.clone();
-            schedule(move |_| {
+            nvim_oxi::schedule(move |_| {
                 match event {
                     WebsocketClientInboundEvent::Connected => {
                         if let Some(on_connect) = callbacks.on_connect.clone() {
@@ -333,7 +331,7 @@ struct WebsocketClientCallbacks {
 
 impl WebsocketClientCallbacks {
     fn new(client_id: Uuid) -> Result<Self, Box<dyn Error>> {
-        let lua = lua();
+        let lua = nvim_oxi::mlua::lua();
         let callbacks = lua
             .globals()
             .get::<_, LuaTable>("_WEBSOCKET_NVIM")?

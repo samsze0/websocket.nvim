@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use nvim_oxi::conversion::ToObject;
 use nvim_oxi::{Dictionary, Function, Object};
 use uuid::Uuid;
 
@@ -14,17 +15,23 @@ pub fn websocket_client_ffi() -> Dictionary {
         ),
         ("disconnect", Object::from(Function::from_fn(disconnect))),
         ("send_data", Object::from(Function::from_fn(send_data))),
-        ("get_clients", Object::from(Function::from_fn(get_clients)))
+        ("get_clients", Object::from(Function::from_fn(get_clients))),
     ])
 }
 
 fn create_client_and_connect(
     (client_id, connect_addr, extra_headers): (String, String, HashMap<String, String>),
-) -> nvim_oxi::Result<()> {
+) -> nvim_oxi::Result<Option<Object>> {
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = WebsocketClient::new(client_id, connect_addr, extra_headers).unwrap();
+    let client = WebsocketClient::new(client_id.clone(), connect_addr, extra_headers).unwrap();
     registry.insert(client);
-    Ok(())
+    let client = registry
+        .get_mut(&Uuid::parse_str(&client_id).unwrap())
+        .unwrap();
+    if let Err(err) = client.connect_sync() {
+        return Ok(Some(err.to_object().unwrap()));
+    }
+    Ok(None)
 }
 
 fn disconnect(client_id: String) -> nvim_oxi::Result<()> {
@@ -59,7 +66,10 @@ impl From<&WebsocketClient> for Dictionary {
     fn from(client: &WebsocketClient) -> Self {
         Dictionary::from_iter::<[(&str, &str); 2]>([
             ("id", client.id.to_string().as_str().into()),
-            ("connect_addr", client.connect_addr.to_string().as_str().into())
+            (
+                "connect_addr",
+                client.connect_addr.to_string().as_str().into(),
+            ),
         ])
     }
 }

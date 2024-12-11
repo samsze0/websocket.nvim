@@ -1,8 +1,6 @@
 use std::error::Error;
 
 use mlua::prelude::*;
-use nvim_oxi::conversion::ToObject;
-use nvim_oxi::Object;
 
 #[derive(Clone, Debug)]
 pub enum WebsocketClientError {
@@ -20,14 +18,17 @@ pub enum WebsocketClientInboundEvent {
     Error(WebsocketClientError),
 }
 
-// Not necessary (for now)
-impl ToObject for WebsocketClientError {
-    fn to_object(self) -> Result<Object, nvim_oxi::conversion::Error> {
+impl nvim_oxi::conversion::ToObject for WebsocketClientError {
+    fn to_object(self) -> Result<nvim_oxi::Object, nvim_oxi::conversion::Error> {
         match self {
-            WebsocketClientError::ConnectionError(message) => Ok(Object::from(message)),
-            WebsocketClientError::DisconnectionError(message) => Ok(Object::from(message)),
-            WebsocketClientError::ReceiveMessageError(message) => Ok(Object::from(message)),
-            WebsocketClientError::SendMessageError(message) => Ok(Object::from(message)),
+            WebsocketClientError::ConnectionError(message) => Ok(nvim_oxi::Object::from(message)),
+            WebsocketClientError::DisconnectionError(message) => {
+                Ok(nvim_oxi::Object::from(message))
+            }
+            WebsocketClientError::ReceiveMessageError(message) => {
+                Ok(nvim_oxi::Object::from(message))
+            }
+            WebsocketClientError::SendMessageError(message) => Ok(nvim_oxi::Object::from(message)),
         }
     }
 }
