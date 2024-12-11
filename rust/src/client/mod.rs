@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use url::Url;
 use uuid::Uuid;
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use tokio_tungstenite::tungstenite::{self};
 
 mod ffi;
@@ -144,6 +144,7 @@ async fn start_client(
                                 }
                             }
                             WebsocketClientCloseConnectionEvent::Forceful => {
+                                warn!("Forcefully closing WebSocket connection");
                                 break
                             }
                         }
@@ -248,7 +249,6 @@ impl WebsocketClient {
                     .unwrap_or_else(|err| error!("Failed to send event: {}", err));
             };
 
-            println!("WebSocket client has finished.");
             WEBSOCKET_CLIENT_REGISTRY.lock().remove(&id);
         });
 
