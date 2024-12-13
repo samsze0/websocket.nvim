@@ -101,16 +101,18 @@ vim.cmd("sleep 1")
 
 T.assert(server:is_active())
 
-client_1:try_connect()
-client_2:try_connect()
+local client_1_connect_error = client_1:connect()
+local client_2_connect_error = client_2:connect()
+assert(not client_1_connect_error, client_1_connect_error)
+assert(not client_2_connect_error, client_2_connect_error)
 
 vim.cmd("sleep 1")
 
 T.assert(client_1:is_active())
 T.assert(client_2:is_active())
 
-client_1:try_send_data("Hi from client 1")
-client_2:try_send_data("Hi from client 2")
+client_1:send_data("Hi from client 1")
+client_2:send_data("Hi from client 2")
 
 vim.cmd("sleep 1")
 

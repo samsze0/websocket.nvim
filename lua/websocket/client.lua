@@ -55,7 +55,9 @@ function WebsocketClient.new(opts)
 end
 
 -- Connect to the websocket server
-function WebsocketClient:try_connect()
+--,
+---@return WebsocketClientErrorType?
+function WebsocketClient:connect()
   _G["_WEBSOCKET_NVIM"].clients.callbacks[self.client_id] = {
     on_message = function(client_id, message)
       local client = WebsocketClientMap[client_id]
@@ -90,7 +92,7 @@ function WebsocketClient:try_connect()
       if client.on_error then client.on_error(client, err) end
     end,
   }
-  websocket_client_ffi.connect(
+  return websocket_client_ffi.connect(
     self.client_id,
     self.connect_addr,
     self.extra_headers
@@ -115,12 +117,12 @@ end
 -- Send data to the websocket server
 --
 ---@param data string
-function WebsocketClient:try_send_data(data)
+function WebsocketClient:send_data(data)
   websocket_client_ffi.send_data(self.client_id, data)
 end
 
 -- Disconnect from the websocket server
-function WebsocketClient:try_disconnect()
+function WebsocketClient:disconnect()
   websocket_client_ffi.disconnect(self.client_id)
 end
 

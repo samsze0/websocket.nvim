@@ -131,13 +131,14 @@ _G["_WEBSOCKET_NVIM"].clients.callbacks[client_2_info.id] = {
   end,
 }
 
-websocket_client_ffi.connect(
+local client_1_connect_error = websocket_client_ffi.connect(
   client_1_info.id,
   ("ws://localhost:%d"):format(server_info.port),
   {
     ["Extra-test-header"] = "test",
   }
 )
+assert(not client_1_connect_error, client_1_connect_error)
 
 vim.cmd("sleep " .. 1)
 
@@ -154,13 +155,14 @@ vim.cmd("sleep " .. 1)
 T.assert_eq(client_1_info.last_message, "Reply from server")
 T.assert_not(client_1_info.last_error)
 
-websocket_client_ffi.connect(
+local client_2_connect_error = websocket_client_ffi.connect(
   client_2_info.id,
   ("ws://localhost:%d"):format(server_info.port),
   {
     ["Extra-test-header"] = "test",
   }
 )
+assert(not client_2_connect_error, client_2_connect_error)
 
 vim.cmd("sleep " .. 1)
 
